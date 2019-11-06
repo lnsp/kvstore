@@ -3,7 +3,10 @@ package table
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 
 	"valar/godat/pkg/store/table/index"
 
@@ -25,10 +28,10 @@ const (
 
 type Memtable struct {
 	Name string
+	Size int64
 
-	log  *os.File
-	mem  *index.Memory
-	size int64
+	log *os.File
+	mem *index.Memory
 }
 
 func NewMemtable(name string) (*Memtable, error) {
@@ -59,7 +62,7 @@ func NewMemtable(name string) (*Memtable, error) {
 			return nil, err
 		}
 		Memtable.mem.Put(key, value)
-		Memtable.size += 16 + keyLen + valueLen
+		Memtable.Size += 16 + keyLen + valueLen
 	}
 	return Memtable, nil
 }
@@ -82,7 +85,7 @@ func (table *Memtable) commit(key, value []byte) error {
 	if _, err := table.log.Write(value); err != nil {
 		return err
 	}
-	table.size += 16 + keyLen + valueLen
+	table.Size += 16 + keyLen + valueLen
 	return nil
 }
 
@@ -152,12 +155,35 @@ func Open(name string) (*Table, error) {
 		return table, err
 	}
 	defer indexFile.Close()
+	if _, err := table.Index.ReadFrom(indexFile); err != nil {
+		return table, err
+	}
 	filterFile, err := os.Open(name + filterSuffix)
 	if err != nil {
 		return table, err
 	}
 	defer filterFile.Close()
+	if _, err := table.Filter.ReadFrom(filterFile); err != nil {
+		return table, err
+	}
 	return table, nil
+}
+
+// OpenGlob opens a slice of tables identified by a common prefix.
+func OpenGlob(glob string) ([]*Table, error) {
+	matches, err := filepath.Glob(fmt.Sprintf("%s*%s", glob, tableSuffix))
+	if err != nil {
+		return nil, err
+	}
+	tables := make([]*Table, 0, len(matches))
+	for _, name := range matches {
+		table, err := Open(strings.TrimSuffix(name, tableSuffix))
+		if err != nil {
+			return nil, err
+		}
+		tables = append(tables, table)
+	}
+	return tables, nil
 }
 
 // Close closes a table file.
