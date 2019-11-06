@@ -2,37 +2,118 @@ package store
 
 import (
 	"bytes"
-
-	"github.com/emirpasic/gods/trees/redblacktree"
-	"github.com/emirpasic/gods/utils"
+	"encoding/binary"
+	"fmt"
+	"time"
+	"valar/godat/pkg/store/table"
 )
 
+func tableName(name string) string {
+	return fmt.Sprintf("%s-%s", name, time.Now().UTC().Format("2006-02-01-15-04-05"))
+}
+
 type Record struct {
-	Value     []byte
-	Timestamp int64
+	Time  int64
+	Value []byte
+}
+
+func (record Record) String() string {
+	return fmt.Sprintf("%s [%d]", string(record.Value), record.Time)
+}
+
+func (record *Record) FromBytes(data []byte) {
+	buffer := bytes.NewBuffer(data)
+	binary.Read(buffer, binary.BigEndian, &record.Time)
+	record.Value = buffer.Bytes()
+}
+
+func (record *Record) Bytes() []byte {
+	buffer := new(bytes.Buffer)
+	binary.Write(buffer, binary.BigEndian, record.Time)
+	buffer.Write(record.Value)
+	return buffer.Bytes()
 }
 
 type Store struct {
-	mem *redblacktree.Tree
+	Name string
+
+	memtable *table.Memtable
+	tables   []*table.Table
 }
 
-func New() (*Store, error) {
-	store := &Store{
-		mem: redblacktree.NewWith(utils.Comparator(func(a, b interface{}) int {
-			return bytes.Compare(a.([]byte), b.([]byte))
-		})),
+func New(name string) (*Store, error) {
+	memtable, err := table.NewMemtable(tableName(name))
+	if err != nil {
+		return nil, err
 	}
-	return store, nil
+	return &Store{
+		Name:     name,
+		memtable: memtable,
+	}, nil
 }
 
-func (store *Store) Put(key []byte, record *Record) {
-	store.mem.Put(key, record)
-}
-
-func (store *Store) Get(key []byte) (*Record, bool) {
-	record, ok := store.mem.Get(key)
-	if !ok {
-		return nil, false
+func (store *Store) Flush() error {
+	tmp := store.memtable
+	memtable, err := table.NewMemtable(tableName(store.Name))
+	if err != nil {
+		return err
 	}
-	return record.(*Record), true
+	store.memtable = memtable
+	if err := tmp.Compact(); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := tmp.Cleanup(); err != nil {
+		return err
+	}
+	flushed, err := table.Open(tmp.Name)
+	if err != nil {
+		return err
+	}
+	store.tables = append(store.tables, flushed)
+	return nil
+}
+
+func (store *Store) Close() error {
+	if err := store.memtable.Compact(); err != nil {
+		return err
+	}
+	if err := store.memtable.Close(); err != nil {
+		return err
+	}
+	if err := store.memtable.Cleanup(); err != nil {
+		return err
+	}
+	for _, table := range store.tables {
+		if err := table.Close(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (store *Store) Put(key []byte, record *Record) error {
+	return store.memtable.Put(key, record.Bytes())
+}
+
+func (store *Store) collect(key []byte) [][]byte {
+	values := store.memtable.Get(key)
+	for _, t := range store.tables {
+		local := t.Get(key)
+		values = append(values, local...)
+	}
+	return values
+}
+
+func (store *Store) Get(key []byte) []*Record {
+	values := store.collect(key)
+	records := make([]*Record, len(values))
+	for i, v := range values {
+		rec := &Record{}
+		rec.FromBytes(v)
+		records[i] = rec
+	}
+	return records
 }
