@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -94,6 +95,28 @@ func (table *Memtable) Put(key, value []byte) error {
 		return err
 	}
 	table.mem.Put(key, value)
+	return nil
+}
+
+func (table *Memtable) Merge(newer *Memtable) error {
+	// Copy all log entries to this table
+	newer.log.Seek(0, 0)
+	_, err := io.Copy(table.log, newer.log)
+	if err != nil {
+		return err
+	}
+	// Remove old log file
+	if err := newer.Close(); err != nil {
+		return err
+	}
+	if err := newer.Cleanup(); err != nil {
+		return err
+	}
+	// Copy memory conents
+	iterator := newer.mem.Iterator()
+	for iterator.Next() {
+		table.mem.Put(iterator.Key(), iterator.Value())
+	}
 	return nil
 }
 
