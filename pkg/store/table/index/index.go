@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"io"
 
+	"github.com/emirpasic/gods/sets/treeset"
 	"github.com/emirpasic/gods/trees/redblacktree"
 	"github.com/emirpasic/gods/utils"
 	lru "github.com/hashicorp/golang-lru"
@@ -32,6 +33,81 @@ func NewFilter() *Filter {
 	return &Filter{
 		bloom.New(20000, 5),
 	}
+}
+
+type Memory struct {
+	*redblacktree.Tree
+}
+
+func NewMemory() *Memory {
+	tree := redblacktree.NewWith(byteComparator)
+	return &Memory{tree}
+}
+
+func (memory *Memory) Put(key []byte, value []byte) {
+	node, ok := memory.Tree.Get(key)
+	if !ok {
+		node = treeset.NewWith(byteComparator)
+		memory.Tree.Put(key, node)
+	}
+	set := node.(*treeset.Set)
+	set.Add(value)
+}
+
+func (memory *Memory) Get(key []byte) [][]byte {
+	node, ok := memory.Tree.Get(key)
+	if !ok {
+		return nil
+	}
+	set := node.(*treeset.Set)
+	values := make([][]byte, set.Size())
+	for i, v := range set.Values() {
+		values[i] = v.([]byte)
+	}
+	return values
+}
+
+func (memory *Memory) Iterator() MemoryIterator {
+	return MemoryIterator{
+		tree: memory.Tree.Iterator(),
+	}
+}
+
+type MemoryIterator struct {
+	tree       redblacktree.Iterator
+	set        treeset.Iterator
+	key, value []byte
+	init       bool
+}
+
+func (iterator *MemoryIterator) Next() bool {
+	if !iterator.init {
+		if !iterator.tree.Next() {
+			return false
+		}
+		iterator.set = iterator.tree.Value().(*treeset.Set).Iterator()
+		iterator.key = iterator.tree.Key().([]byte)
+		iterator.init = true
+	}
+	next := iterator.set.Next()
+	for !next && iterator.tree.Next() {
+		iterator.set = iterator.tree.Value().(*treeset.Set).Iterator()
+		iterator.key = iterator.tree.Key().([]byte)
+		next = iterator.set.Next()
+	}
+	if !next {
+		return false
+	}
+	iterator.value = iterator.set.Value().([]byte)
+	return true
+}
+
+func (iterator *MemoryIterator) Key() []byte {
+	return iterator.key
+}
+
+func (iterator *MemoryIterator) Value() []byte {
+	return iterator.value
 }
 
 type Index struct {
@@ -85,8 +161,10 @@ func (index *Index) ReadFrom(file io.Reader) (int64, error) {
 }
 
 func NewIndex() *Index {
-	tree := redblacktree.NewWith(utils.Comparator(func(a, b interface{}) int {
-		return bytes.Compare(a.([]byte), b.([]byte))
-	}))
+	tree := redblacktree.NewWith(byteComparator)
 	return &Index{tree}
 }
+
+var byteComparator = utils.Comparator(func(a, b interface{}) int {
+	return bytes.Compare(a.([]byte), b.([]byte))
+})
