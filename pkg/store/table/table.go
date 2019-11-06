@@ -8,16 +8,119 @@ import (
 	"valar/godat/pkg/store/table/index"
 
 	"github.com/golang/snappy"
+	"github.com/ncw/directio"
 )
 
 const (
+	logSuffix    = ".log"
 	tableSuffix  = ".table"
 	indexSuffix  = ".index"
 	filterSuffix = ".filter"
+
+	// MaxBlockSize defines the maximum size of a table block. By default 64 KiB.
 	MaxBlockSize = 2 << 16
+	// MaxCacheSize defines the maximum number of blocks cached in memory. By default 8 MiB.
 	MaxCacheSize = 128
 )
 
+type Memtable struct {
+	Name string
+
+	log  *os.File
+	mem  *index.Memory
+	size int64
+}
+
+func NewMemtable(name string) (*Memtable, error) {
+	log, err := directio.OpenFile(name+logSuffix, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		return nil, err
+	}
+	Memtable := &Memtable{
+		Name: name,
+		log:  log,
+		mem:  index.NewMemory(),
+	}
+	// Read until nothing available
+	var keyLen, valueLen int64
+	for binary.Read(log, binary.LittleEndian, &keyLen) == nil {
+		// Read value len
+		if err := binary.Read(log, binary.LittleEndian, &valueLen); err != nil {
+			return nil, err
+		}
+		// Read key
+		key := make([]byte, keyLen)
+		if _, err := log.Read(key); err != nil {
+			return nil, err
+		}
+		// Read value
+		value := make([]byte, valueLen)
+		if _, err := log.Read(value); err != nil {
+			return nil, err
+		}
+		Memtable.mem.Put(key, value)
+		Memtable.size += 16 + keyLen + valueLen
+	}
+	return Memtable, nil
+}
+
+func (table *Memtable) Get(key []byte) [][]byte {
+	return table.mem.Get(key)
+}
+
+func (table *Memtable) commit(key, value []byte) error {
+	keyLen, valueLen := int64(len(key)), int64(len(value))
+	if err := binary.Write(table.log, binary.LittleEndian, keyLen); err != nil {
+		return err
+	}
+	if err := binary.Write(table.log, binary.LittleEndian, valueLen); err != nil {
+		return err
+	}
+	if _, err := table.log.Write(key); err != nil {
+		return err
+	}
+	if _, err := table.log.Write(value); err != nil {
+		return err
+	}
+	table.size += 16 + keyLen + valueLen
+	return nil
+}
+
+func (table *Memtable) Put(key, value []byte) error {
+	if err := table.commit(key, value); err != nil {
+		return err
+	}
+	table.mem.Put(key, value)
+	return nil
+}
+
+func (table *Memtable) Close() error {
+	return table.log.Close()
+}
+
+func (table *Memtable) Compact() error {
+	compacted, err := OpenWritable(table.Name)
+	if err != nil {
+		return err
+	}
+	defer compacted.Close()
+	iterator := table.mem.Iterator()
+	for iterator.Next() {
+		if err := compacted.Append(iterator.Key(), iterator.Value()); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (table *Memtable) Cleanup() error {
+	return os.Remove(table.Name + logSuffix)
+}
+
+// Table is a key-sorted list of key-value pairs stored on disk.
+// It is backed by multiple performance and size optimizations, such as
+// block-based compression, key filtering using bloom filters,
+// ARC cache for block accesses and RB tree based key indexing.
 type Table struct {
 	Name string
 	File *os.File
@@ -62,7 +165,7 @@ func (table *Table) Close() error {
 	return table.File.Close()
 }
 
-func (table *Table) find(key []byte) ([]byte, bool) {
+func (table *Table) seek(key []byte) ([]byte, bool) {
 	// Check filter
 	if !table.Filter.Test(key) {
 		return nil, false
@@ -100,10 +203,11 @@ func (table *Table) closeMerge() error {
 	return table.mfile.Close()
 }
 
-func (table *Table) Get(key []byte) ([]byte, bool) {
-	block, ok := table.find(key)
+// Get returns the matching value to a key.
+func (table *Table) Get(key []byte) [][]byte {
+	block, ok := table.seek(key)
 	if !ok {
-		return nil, false
+		return nil
 	}
 	return Find(block, key)
 }
@@ -218,12 +322,12 @@ func OpenWritable(name string) (*WritableTable, error) {
 	}, nil
 }
 
-func max(a, b []byte) []byte {
+func sort(a, b []byte) ([]byte, []byte) {
 	switch bytes.Compare(a, b) {
 	case -1:
-		return b
+		return a, b
 	default:
-		return a
+		return b, a
 	}
 }
 
@@ -245,7 +349,11 @@ func Merge(name string, left *Table, right *Table) error {
 	for ls.Peek() && rs.Peek() {
 		switch bytes.Compare(ls.Key(), rs.Key()) {
 		case 0:
-			if err := table.Append(ls.Key(), max(ls.Value(), rs.Value())); err != nil {
+			min, max := sort(ls.Value(), rs.Value())
+			if err := table.Append(ls.Key(), min); err != nil {
+				return err
+			}
+			if err := table.Append(ls.Key(), max); err != nil {
 				return err
 			}
 			ls.Skip()
@@ -300,9 +408,14 @@ func Seek(file *os.File, offset int64) ([]byte, int64, bool) {
 }
 
 // Find looks for a row with the given key in the block.
-func Find(block, key []byte) ([]byte, bool) {
-	var offset, size int64 = 0, int64(len(block))
-	for offset < size {
+func Find(block, key []byte) [][]byte {
+	var (
+		offset = int64(0)
+		size   = int64(len(block))
+		scan   = true
+		values = make([][]byte, 0, 1)
+	)
+	for offset < size && scan {
 		var (
 			keyLen     = binary.LittleEndian.Uint16(block[offset : offset+2])
 			valueLen   = binary.LittleEndian.Uint16(block[offset+2 : offset+4])
@@ -312,14 +425,13 @@ func Find(block, key []byte) ([]byte, bool) {
 		)
 		switch bytes.Compare(key, block[keyStart:valueStart]) {
 		case 0:
-			return block[valueStart:valueEnd], true
+			values = append(values, block[valueStart:valueEnd])
 		case 1:
-			return nil, false
-		case -1:
-			offset = valueEnd
+			scan = false
 		}
+		offset = valueEnd
 	}
-	return nil, false
+	return values
 }
 
 // Next reads the next row from the block and returns the key, value and offset.
