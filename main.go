@@ -1,9 +1,13 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"os"
-	"valar/godat/pkg/store/table"
+	"strings"
+	"time"
+
+	"valar/godat/pkg/store"
 )
 
 func main() {
@@ -14,29 +18,37 @@ func main() {
 }
 
 func run() error {
-	/*
-				sstable, err := table.OpenWritable("world")
-				if err != nil {
-					return err
-				}
-				sstable.Append([]byte("A"), []byte("Zalue1"))
-				sstable.Append([]byte("C"), []byte("Zalue4"))
-				sstable.Append([]byte("E"), []byte("Zalue4"))
-				sstable.Flush()
-				sstable.Append([]byte("G"), []byte("ZALI"))
-				sstable.Append([]byte("Y"), []byte("HIER"))
-				sstable.Close()
-		sstable1, _ := table.Open("hello")
-		sstable2, _ := table.Open("world")
-		table.Merge("out", sstable1, sstable2)
-	*/
-	sstable, err := table.Open("out")
+	db, err := store.New("local")
 	if err != nil {
 		return err
 	}
-	iterator := sstable.Iterate()
-	for key, value, ok := iterator(); ok; key, value, ok = iterator() {
-		fmt.Println(string(key), string(value))
+	defer db.Close()
+	fmt.Print("> ")
+	scanner := bufio.NewScanner(os.Stdin)
+	for scanner.Scan() {
+		line := scanner.Text()
+		args := strings.Split(line, " ")
+		switch strings.ToLower(args[0]) {
+		case "put":
+			key, value := []byte(args[1]), []byte(args[2])
+			db.Put(key, &store.Record{
+				Time:  time.Now().UTC().Unix(),
+				Value: value,
+			})
+		case "get":
+			key := []byte(args[1])
+			records := db.Get(key)
+			for _, r := range records {
+				fmt.Println(r)
+			}
+		case "flush":
+			if err := db.Flush(); err != nil {
+				fmt.Println("error:", err)
+			}
+		case "exit":
+			return nil
+		}
+		fmt.Print("> ")
 	}
 	return nil
 }
