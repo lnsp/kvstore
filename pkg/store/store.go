@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"sync"
 	"time"
 	"valar/godat/pkg/store/table"
 )
@@ -39,8 +40,13 @@ func (record *Record) Bytes() []byte {
 type Store struct {
 	Name string
 
-	memtable *table.Memtable
-	tables   []*table.Table
+	// access synchronizes all actions related to the active memtable.
+	memory, disk sync.RWMutex
+	// flush synchronizes all write-actions related to the flushed memtable.
+	flush sync.Mutex
+
+	active, flushed *table.Memtable
+	tables          []*table.Table
 }
 
 func New(name string) (*Store, error) {
@@ -49,8 +55,8 @@ func New(name string) (*Store, error) {
 		return nil, err
 	}
 	store := &Store{
-		Name:     name,
-		memtable: memtable,
+		Name:   name,
+		active: memtable,
 	}
 	if err := store.Restore(); err != nil {
 		return nil, err
@@ -68,39 +74,64 @@ func (store *Store) Restore() error {
 }
 
 func (store *Store) Flush() error {
-	tmp := store.memtable
-	memtable, err := table.NewMemtable(tableName(store.Name))
+	mergeBack := func() {
+		// Merge flushed and active back into one table
+		store.memory.Lock()
+		store.flushed.Merge(store.active)
+		store.active = store.flushed
+		store.flushed = nil
+		store.memory.Unlock()
+	}
+	replace, err := table.NewMemtable(tableName(store.Name))
 	if err != nil {
 		return err
 	}
-	store.memtable = memtable
-	if err := tmp.Compact(); err != nil {
+	// Lock any "flush" related activities
+	store.flush.Lock()
+	defer store.flush.Unlock()
+	// Lock active table for swapping
+	store.memory.Lock()
+	store.flushed = store.active
+	store.active = replace
+	store.memory.Unlock()
+	// Unlock active table again
+	// Compact flushed table
+	if err := store.flushed.Compact(); err != nil {
+		mergeBack()
 		return err
 	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := tmp.Cleanup(); err != nil {
-		return err
-	}
-	flushed, err := table.Open(tmp.Name)
+	// Open new table
+	flushed, err := table.Open(store.flushed.Name)
 	if err != nil {
+		mergeBack()
 		return err
 	}
+	store.flushed.Close()
+	store.flushed.Cleanup()
+
+	// Add flushed table to tables
+	store.memory.Lock()
+	store.flushed = nil
+	store.disk.Lock()
 	store.tables = append(store.tables, flushed)
+	store.disk.Unlock()
+	store.memory.Unlock()
+
 	return nil
 }
 
 func (store *Store) Close() error {
-	if err := store.memtable.Compact(); err != nil {
+	store.memory.Lock()
+	if err := store.active.Compact(); err != nil {
 		return err
 	}
-	if err := store.memtable.Close(); err != nil {
+	if err := store.active.Close(); err != nil {
 		return err
 	}
-	if err := store.memtable.Cleanup(); err != nil {
+	if err := store.active.Cleanup(); err != nil {
 		return err
 	}
+	store.disk.Lock()
 	for _, table := range store.tables {
 		if err := table.Close(); err != nil {
 			return err
@@ -110,21 +141,30 @@ func (store *Store) Close() error {
 }
 
 func (store *Store) Put(key []byte, record *Record) error {
-	if err := store.memtable.Put(key, record.Bytes()); err != nil {
+	store.memory.Lock()
+	defer store.memory.Unlock()
+	if err := store.active.Put(key, record.Bytes()); err != nil {
 		return err
 	}
-	if store.memtable.Size >= MaxMemSize {
-		return store.Flush()
+	if store.active.Size >= MaxMemSize {
+		go store.Flush()
 	}
 	return nil
 }
 
 func (store *Store) collect(key []byte) [][]byte {
-	values := store.memtable.Get(key)
+	store.memory.RLock()
+	values := store.active.Get(key)
+	if store.flushed != nil {
+		values = append(values, store.flushed.Get(key)...)
+	}
+	store.memory.RUnlock()
+	store.disk.RLock()
 	for _, t := range store.tables {
 		local := t.Get(key)
 		values = append(values, local...)
 	}
+	store.disk.RUnlock()
 	return values
 }
 
