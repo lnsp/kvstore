@@ -8,6 +8,8 @@ import (
 	"valar/godat/pkg/store/table"
 )
 
+const MaxMemSize = 2 << 26
+
 func tableName(name string) string {
 	return fmt.Sprintf("%s-%s", name, time.Now().UTC().Format("2006-02-01-15-04-05"))
 }
@@ -46,10 +48,23 @@ func New(name string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Store{
+	store := &Store{
 		Name:     name,
 		memtable: memtable,
-	}, nil
+	}
+	if err := store.Restore(); err != nil {
+		return nil, err
+	}
+	return store, nil
+}
+
+func (store *Store) Restore() error {
+	tables, err := table.OpenGlob(store.Name)
+	if err != nil {
+		return err
+	}
+	store.tables = tables
+	return nil
 }
 
 func (store *Store) Flush() error {
@@ -95,7 +110,13 @@ func (store *Store) Close() error {
 }
 
 func (store *Store) Put(key []byte, record *Record) error {
-	return store.memtable.Put(key, record.Bytes())
+	if err := store.memtable.Put(key, record.Bytes()); err != nil {
+		return err
+	}
+	if store.memtable.Size >= MaxMemSize {
+		return store.Flush()
+	}
+	return nil
 }
 
 func (store *Store) collect(key []byte) [][]byte {
