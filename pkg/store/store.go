@@ -7,9 +7,17 @@ import (
 	"sync"
 	"time"
 	"valar/godat/pkg/store/table"
+
+	"github.com/sirupsen/logrus"
 )
 
-const MaxMemSize = 2 << 26
+var logger = logrus.New()
+
+func init() {
+	logger.SetLevel(logrus.DebugLevel)
+}
+
+const MaxMemSize = 2 << 27
 
 func tableName(name string) string {
 	return fmt.Sprintf("%s-%s", name, time.Now().UTC().Format("2006-02-01-15-04-05"))
@@ -77,14 +85,9 @@ type Store struct {
 }
 
 func New(name string) (*Store, error) {
-	memtable, err := table.NewMemtable(tableName(name))
-	if err != nil {
-		return nil, err
-	}
 	store := &Store{
-		Name:   name,
-		active: memtable,
-		flush:  makeMutex(),
+		Name:  name,
+		flush: makeMutex(),
 	}
 	if err := store.Restore(); err != nil {
 		return nil, err
@@ -93,11 +96,26 @@ func New(name string) (*Store, error) {
 }
 
 func (store *Store) Restore() error {
-	tables, err := table.OpenGlob(store.Name)
+	// Remove intermediate tables
+	err := table.RemoveIntermediateTables(store.Name)
 	if err != nil {
 		return err
 	}
-	store.tables = tables
+	// Load new memtable
+	store.active, err = table.OpenMemtable(store.Name, tableName(store.Name))
+	if err != nil {
+		return err
+	}
+	if store.active.Size >= MaxMemSize {
+		if err := store.Flush(); err != nil {
+			return err
+		}
+	}
+	// Remove all tables with matching logs
+	store.tables, err = table.OpenTables(store.Name)
+	if err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -129,21 +147,34 @@ func (store *Store) Flush() error {
 	store.flushed = store.active
 	store.active = replace
 	store.memory.Unlock()
+
+	logger.WithFields(logrus.Fields{
+		"name": store.flushed.Name,
+		"size": store.flushed.Size,
+	}).Debug("Flushing memtable")
 	// Unlock active table again
 	// Compact flushed table
 	if err := store.flushed.Compact(); err != nil {
 		store.mergeFlushed()
 		return err
 	}
+	logger.WithFields(logrus.Fields{
+		"name": store.flushed.Name,
+	}).Debug("Compacted flushed memtable")
 	// Open new table
 	flushed, err := table.Open(store.flushed.Name)
 	if err != nil {
+		logger.WithFields(logrus.Fields{
+			"name": store.flushed.Name,
+		}).WithError(err).Error("Failed to open flushed table, merging back into main memory")
 		store.mergeFlushed()
 		return err
 	}
 	store.flushed.Close()
 	store.flushed.Cleanup()
-
+	logger.WithFields(logrus.Fields{
+		"name": store.flushed.Name,
+	}).Debug("Moved flushed to disk")
 	// Add flushed table to tables
 	store.memory.Lock()
 	store.flushed = nil
@@ -214,4 +245,15 @@ func (store *Store) Get(key []byte) []*Record {
 		records[i] = rec
 	}
 	return records
+}
+
+func (store *Store) MemSize() int64 {
+	var size int64
+	store.memory.Lock()
+	size += store.active.Size
+	if store.flushed != nil {
+		size += store.flushed.Size
+	}
+	store.memory.Unlock()
+	return size
 }
