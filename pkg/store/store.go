@@ -37,13 +37,40 @@ func (record *Record) Bytes() []byte {
 	return buffer.Bytes()
 }
 
+type mutex struct {
+	lock chan bool
+}
+
+func (m mutex) Lock() {
+	<-m.lock
+}
+
+func (m mutex) TryLock() bool {
+	select {
+	case <-m.lock:
+		return true
+	default:
+		return false
+	}
+}
+
+func (m mutex) Unlock() {
+	m.lock <- true
+}
+
+func makeMutex() mutex {
+	m := mutex{make(chan bool, 1)}
+	m.Unlock()
+	return m
+}
+
 type Store struct {
 	Name string
 
 	// access synchronizes all actions related to the active memtable.
 	memory, disk sync.RWMutex
 	// flush synchronizes all write-actions related to the flushed memtable.
-	flush sync.Mutex
+	flush mutex
 
 	active, flushed *table.Memtable
 	tables          []*table.Table
@@ -57,6 +84,7 @@ func New(name string) (*Store, error) {
 	store := &Store{
 		Name:   name,
 		active: memtable,
+		flush:  makeMutex(),
 	}
 	if err := store.Restore(); err != nil {
 		return nil, err
@@ -73,22 +101,29 @@ func (store *Store) Restore() error {
 	return nil
 }
 
+// mergeFlushed merges active and flushed memtables back into one
+// and restores it as the active memtable.
+func (store *Store) mergeFlushed() {
+	store.memory.Lock()
+	store.flushed.Merge(store.active)
+	store.active = store.flushed
+	store.flushed = nil
+	store.memory.Unlock()
+}
+
+// Flush replaces the active memtable with a new one
+// and compacts the old one to disk. This can be done
+// while serving entries from the flushed memtable
+// as well as the active memtable and all other disk tables.
 func (store *Store) Flush() error {
-	mergeBack := func() {
-		// Merge flushed and active back into one table
-		store.memory.Lock()
-		store.flushed.Merge(store.active)
-		store.active = store.flushed
-		store.flushed = nil
-		store.memory.Unlock()
-	}
+	// store.flush must be locked on call.
+	store.flush.TryLock()
+	// Lock any "flush" related activities
+	defer store.flush.Unlock()
 	replace, err := table.NewMemtable(tableName(store.Name))
 	if err != nil {
 		return err
 	}
-	// Lock any "flush" related activities
-	store.flush.Lock()
-	defer store.flush.Unlock()
 	// Lock active table for swapping
 	store.memory.Lock()
 	store.flushed = store.active
@@ -97,13 +132,13 @@ func (store *Store) Flush() error {
 	// Unlock active table again
 	// Compact flushed table
 	if err := store.flushed.Compact(); err != nil {
-		mergeBack()
+		store.mergeFlushed()
 		return err
 	}
 	// Open new table
 	flushed, err := table.Open(store.flushed.Name)
 	if err != nil {
-		mergeBack()
+		store.mergeFlushed()
 		return err
 	}
 	store.flushed.Close()
@@ -116,7 +151,6 @@ func (store *Store) Flush() error {
 	store.tables = append(store.tables, flushed)
 	store.disk.Unlock()
 	store.memory.Unlock()
-
 	return nil
 }
 
@@ -137,16 +171,19 @@ func (store *Store) Close() error {
 			return err
 		}
 	}
+	// After this, all PUT and GET operations on this
+	// table will lead to a deadlock.
 	return nil
 }
 
 func (store *Store) Put(key []byte, record *Record) error {
+	// Lock in-memory table write access.
 	store.memory.Lock()
 	defer store.memory.Unlock()
 	if err := store.active.Put(key, record.Bytes()); err != nil {
 		return err
 	}
-	if store.active.Size >= MaxMemSize {
+	if store.active.Size >= MaxMemSize && store.flush.TryLock() {
 		go store.Flush()
 	}
 	return nil
