@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"valar/godat/pkg/store/table/index"
 
@@ -31,8 +32,14 @@ type Memtable struct {
 	Name string
 	Size int64
 
-	log *os.File
-	mem *index.Memory
+	log       *File
+	mem       *index.Memory
+	memaccess sync.RWMutex
+}
+
+type File struct {
+	*os.File
+	sync.Mutex
 }
 
 func NewMemtable(name string) (*Memtable, error) {
@@ -42,7 +49,7 @@ func NewMemtable(name string) (*Memtable, error) {
 	}
 	Memtable := &Memtable{
 		Name: name,
-		log:  log,
+		log:  &File{File: log},
 		mem:  index.NewMemory(),
 	}
 	// Read until nothing available
@@ -69,10 +76,15 @@ func NewMemtable(name string) (*Memtable, error) {
 }
 
 func (table *Memtable) Get(key []byte) [][]byte {
-	return table.mem.Get(key)
+	table.memaccess.RLock()
+	values := table.mem.Get(key)
+	table.memaccess.RUnlock()
+	return values
 }
 
 func (table *Memtable) commit(key, value []byte) error {
+	table.log.Lock()
+	defer table.log.Unlock()
 	keyLen, valueLen := int64(len(key)), int64(len(value))
 	if err := binary.Write(table.log, binary.LittleEndian, keyLen); err != nil {
 		return err
@@ -94,12 +106,16 @@ func (table *Memtable) Put(key, value []byte) error {
 	if err := table.commit(key, value); err != nil {
 		return err
 	}
+	table.memaccess.Lock()
 	table.mem.Put(key, value)
+	table.memaccess.Unlock()
 	return nil
 }
 
 func (table *Memtable) Merge(newer *Memtable) error {
 	// Copy all log entries to this table
+	newer.log.Lock()
+	defer newer.log.Unlock()
 	newer.log.Seek(0, 0)
 	_, err := io.Copy(table.log, newer.log)
 	if err != nil {
@@ -113,10 +129,14 @@ func (table *Memtable) Merge(newer *Memtable) error {
 		return err
 	}
 	// Copy memory conents
+	table.memaccess.Lock()
+	newer.memaccess.RLock()
 	iterator := newer.mem.Iterator()
 	for iterator.Next() {
 		table.mem.Put(iterator.Key(), iterator.Value())
 	}
+	newer.memaccess.RUnlock()
+	table.memaccess.Unlock()
 	return nil
 }
 
@@ -130,6 +150,8 @@ func (table *Memtable) Compact() error {
 		return err
 	}
 	defer compacted.Close()
+	table.memaccess.RLock()
+	defer table.memaccess.RUnlock()
 	iterator := table.mem.Iterator()
 	for iterator.Next() {
 		if err := compacted.Append(iterator.Key(), iterator.Value()); err != nil {
@@ -143,13 +165,29 @@ func (table *Memtable) Cleanup() error {
 	return os.Remove(table.Name + logSuffix)
 }
 
+func (table *Memtable) All() []MemtableRecord {
+	table.memaccess.RLock()
+	defer table.memaccess.RUnlock()
+	records := make([]MemtableRecord, table.mem.Size())
+	iterator := table.mem.SetIterator()
+	for index := 0; iterator.Next(); index++ {
+		records[index] = MemtableRecord{iterator.Key(), iterator.Values()}
+	}
+	return records
+}
+
+type MemtableRecord struct {
+	Key    []byte
+	Values [][]byte
+}
+
 // Table is a key-sorted list of key-value pairs stored on disk.
 // It is backed by multiple performance and size optimizations, such as
 // block-based compression, key filtering using bloom filters,
 // ARC cache for block accesses and RB tree based key indexing.
 type Table struct {
 	Name string
-	File *os.File
+	File *File
 
 	// Performance optimizations
 	Index  *index.Index
@@ -157,7 +195,7 @@ type Table struct {
 	Cache  *index.Cache
 
 	// mfile is reserved for merge operations.
-	mfile *os.File
+	mfile *File
 }
 
 // Open a table-triple and initializes the table file and loads index and filter into memory.
@@ -168,7 +206,7 @@ func Open(name string) (*Table, error) {
 	}
 	table := &Table{
 		Name:   name,
-		File:   tableFile,
+		File:   &File{File: tableFile},
 		Index:  index.NewIndex(),
 		Filter: index.NewFilter(),
 		Cache:  index.NewCache(MaxCacheSize),
@@ -235,13 +273,13 @@ func (table *Table) seek(key []byte) ([]byte, bool) {
 	return block.([]byte), ok
 }
 
-func (table *Table) openMerge() (Scanner, error) {
+func (table *Table) openMerge() (*TableScanner, error) {
 	file, err := os.Open(table.Name + tableSuffix)
 	if err != nil {
-		return Scanner{}, err
+		return nil, err
 	}
-	table.mfile = file
-	return Scanner{
+	table.mfile = &File{File: file}
+	return &TableScanner{
 		block: BlockScanner{
 			file: table.mfile,
 		},
@@ -261,8 +299,8 @@ func (table *Table) Get(key []byte) [][]byte {
 	return Find(block, key)
 }
 
-func (table *Table) Scan() Scanner {
-	return Scanner{
+func (table *Table) Scan() *TableScanner {
+	return &TableScanner{
 		block: BlockScanner{
 			file: table.File,
 		},
@@ -434,8 +472,9 @@ func Merge(name string, left *Table, right *Table) error {
 	return nil
 }
 
-// Seek searches the file for a block at the given offset.
-func Seek(file *os.File, offset int64) ([]byte, int64, bool) {
+func seekCompressedBlock(file *File, offset int64) ([]byte, int64, bool) {
+	file.Lock()
+	defer file.Unlock()
 	// Seek to offset
 	if _, err := file.Seek(offset, os.SEEK_SET); err != nil {
 		return nil, 0, false
@@ -449,11 +488,20 @@ func Seek(file *os.File, offset int64) ([]byte, int64, bool) {
 	if _, err := file.Read(compressedBlock); err != nil {
 		return nil, 0, false
 	}
+	return compressedBlock, 8 + compressedBlockSize, true
+}
+
+// Seek searches the file for a block at the given offset.
+func Seek(file *File, offset int64) ([]byte, int64, bool) {
+	compressedBlock, size, ok := seekCompressedBlock(file, offset)
+	if !ok {
+		return nil, 0, false
+	}
 	block, err := snappy.Decode(nil, compressedBlock)
 	if err != nil {
 		return nil, 0, false
 	}
-	return block, 8 + compressedBlockSize, true
+	return block, size, true
 }
 
 // Find looks for a row with the given key in the block.
@@ -506,7 +554,7 @@ func ScanRows(block []byte) RowScanner {
 }
 
 // ScanBlocks returns a block scanner for the given file.
-func ScanBlocks(file *os.File) BlockScanner {
+func ScanBlocks(file *File) BlockScanner {
 	return BlockScanner{
 		file:   file,
 		offset: 0,
@@ -515,7 +563,7 @@ func ScanBlocks(file *os.File) BlockScanner {
 }
 
 type BlockScanner struct {
-	file           *os.File
+	file           *File
 	block          []byte
 	peeked, offset int64
 }
@@ -591,14 +639,20 @@ func (scanner *RowScanner) Value() []byte {
 	return scanner.value
 }
 
-type Scanner struct {
+type Scanner interface {
+	Next() bool
+	Key() []byte
+	Value() []byte
+}
+
+type TableScanner struct {
 	block BlockScanner
 	row   RowScanner
 
 	key, value []byte
 }
 
-func (scanner *Scanner) Next() bool {
+func (scanner *TableScanner) Next() bool {
 	next := scanner.row.Next()
 	for !next && scanner.block.Next() {
 		scanner.row = ScanRows(scanner.block.Block())
@@ -609,7 +663,7 @@ func (scanner *Scanner) Next() bool {
 	return next
 }
 
-func (scanner *Scanner) Peek() bool {
+func (scanner *TableScanner) Peek() bool {
 	next := scanner.row.Peek()
 	for !next && scanner.block.Next() {
 		scanner.row = ScanRows(scanner.block.Block())
@@ -620,14 +674,14 @@ func (scanner *Scanner) Peek() bool {
 	return next
 }
 
-func (scanner *Scanner) Skip() {
+func (scanner *TableScanner) Skip() {
 	scanner.row.Skip()
 }
 
-func (it *Scanner) Key() []byte {
-	return it.key
+func (scanner *TableScanner) Key() []byte {
+	return scanner.key
 }
 
-func (it *Scanner) Value() []byte {
-	return it.value
+func (scanner *TableScanner) Value() []byte {
+	return scanner.value
 }
