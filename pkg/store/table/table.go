@@ -15,7 +15,6 @@ import (
 
 	"github.com/golang/snappy"
 	"github.com/juju/ratelimit"
-	"github.com/ncw/directio"
 	"github.com/sirupsen/logrus"
 )
 
@@ -103,15 +102,9 @@ func NewMemtable(name string) (*Memtable, error) {
 	}
 	Memtable.Size, err = Memtable.ReadFrom(cached)
 	if err != nil {
-		cached.Close()
 		return nil, fmt.Errorf("failed to load file %s: %v", name, err)
 	}
-	cached.Close()
-	log, err := directio.OpenFile(name+logSuffix, os.O_CREATE|os.O_RDWR, 0644)
-	if err != nil {
-		return nil, err
-	}
-	Memtable.log = &File{File: log}
+	Memtable.log = &File{File: cached}
 	return Memtable, nil
 }
 
@@ -821,6 +814,34 @@ func (scanner *TableScanner) Value() []byte {
 	return scanner.value
 }
 
+type Leveled struct {
+	BaseSize    int
+	LevelSize   int
+	LevelFactor int
+	Base        []*Table
+	Levels      []Run
+}
+
+func (compaction *Leveled) Add(table *Table) error {
+	compaction.Base = append(compaction.Base, table)
+	if len(compaction.Base) > compaction.BaseSize {
+		return compaction.Push()
+	}
+	return nil
+}
+
+func (compaction *Leveled) Push() error {
+	return nil
+}
+
 type Run struct {
-	index *index.RunIndex
+	*index.RunIndex
+	MaxSize int
+}
+
+func NewRun(max int) *Run {
+	return &Run{
+		RunIndex: index.NewRunIndex(),
+		MaxSize:  max,
+	}
 }
