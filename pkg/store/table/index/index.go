@@ -13,7 +13,9 @@ import (
 )
 
 const (
-	indexSuffix = ".index"
+	indexSuffix   = ".index"
+	filterBits    = 20000
+	filterKFamily = 5
 )
 
 type Cache struct {
@@ -31,7 +33,7 @@ type Filter struct {
 
 func NewFilter() *Filter {
 	return &Filter{
-		bloom.New(20000, 5),
+		bloom.New(filterBits, filterKFamily),
 	}
 }
 
@@ -71,6 +73,33 @@ func (memory *Memory) Iterator() MemoryIterator {
 	return MemoryIterator{
 		tree: memory.Tree.Iterator(),
 	}
+}
+
+func (memory *Memory) SetIterator() MemorySetIterator {
+	return MemorySetIterator{
+		tree: memory.Tree.Iterator(),
+	}
+}
+
+type MemorySetIterator struct {
+	tree redblacktree.Iterator
+}
+
+func (iterator *MemorySetIterator) Next() bool {
+	return iterator.tree.Next()
+}
+
+func (iterator *MemorySetIterator) Key() []byte {
+	return iterator.tree.Key().([]byte)
+}
+
+func (iterator *MemorySetIterator) Values() [][]byte {
+	values := iterator.tree.Value().(*treeset.Set).Values()
+	bytes := make([][]byte, len(values))
+	for i, v := range values {
+		bytes[i] = v.([]byte)
+	}
+	return bytes
 }
 
 type MemoryIterator struct {
