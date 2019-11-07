@@ -1,3 +1,4 @@
+// Package index contains data structures to help cope with caches, indices and key filters.
 package index
 
 import (
@@ -13,39 +14,45 @@ import (
 )
 
 const (
-	indexSuffix   = ".index"
 	filterBits    = 20000
 	filterKFamily = 5
 )
 
+// Cache implements a simple ARC cache.
 type Cache struct {
 	*lru.ARCCache
 }
 
+// NewCache initializes a new cache with the given size.
 func NewCache(size int) *Cache {
 	arc, _ := lru.NewARC(size)
 	return &Cache{arc}
 }
 
+// Filter implements a simple key filter based on a bloom filter.
 type Filter struct {
 	*bloom.BloomFilter
 }
 
+// NewFilter initializes a new bloom filter.
 func NewFilter() *Filter {
 	return &Filter{
 		bloom.New(filterBits, filterKFamily),
 	}
 }
 
+// Memory is an in-memory key-valueset store.
 type Memory struct {
 	*redblacktree.Tree
 }
 
+// NewMemory initializes a new in-memory key-valueset store.
 func NewMemory() *Memory {
 	tree := redblacktree.NewWith(byteComparator)
 	return &Memory{tree}
 }
 
+// Put stores the given key-value pair in the in-memory tree.
 func (memory *Memory) Put(key []byte, value []byte) {
 	node, ok := memory.Tree.Get(key)
 	if !ok {
@@ -56,6 +63,7 @@ func (memory *Memory) Put(key []byte, value []byte) {
 	set.Add(value)
 }
 
+// Get returns the valueset for the given key.
 func (memory *Memory) Get(key []byte) [][]byte {
 	node, ok := memory.Tree.Get(key)
 	if !ok {
@@ -69,30 +77,36 @@ func (memory *Memory) Get(key []byte) [][]byte {
 	return values
 }
 
+// Iterator returns an abstraction to iterate through all key-value pairs in the tree.
 func (memory *Memory) Iterator() MemoryIterator {
 	return MemoryIterator{
 		tree: memory.Tree.Iterator(),
 	}
 }
 
+// SetIterator returns an abstraction to iterate through all key-valueset pairs in the tree.
 func (memory *Memory) SetIterator() MemorySetIterator {
 	return MemorySetIterator{
 		tree: memory.Tree.Iterator(),
 	}
 }
 
+// MemorySetIterator implements an iterator for scanning through key-valueset pairs.
 type MemorySetIterator struct {
 	tree redblacktree.Iterator
 }
 
+// Next fetches the next pair and returns true on success.
 func (iterator *MemorySetIterator) Next() bool {
 	return iterator.tree.Next()
 }
 
+// Key returns the pair's key.
 func (iterator *MemorySetIterator) Key() []byte {
 	return iterator.tree.Key().([]byte)
 }
 
+// Values returns the pair's valueset.
 func (iterator *MemorySetIterator) Values() [][]byte {
 	values := iterator.tree.Value().(*treeset.Set).Values()
 	bytes := make([][]byte, len(values))
@@ -102,6 +116,7 @@ func (iterator *MemorySetIterator) Values() [][]byte {
 	return bytes
 }
 
+// MemoryIterator implements an iterator for scanning through key-value pairs.
 type MemoryIterator struct {
 	tree       redblacktree.Iterator
 	set        treeset.Iterator
@@ -109,6 +124,7 @@ type MemoryIterator struct {
 	init       bool
 }
 
+// Next fetches the next pair and returns true on success
 func (iterator *MemoryIterator) Next() bool {
 	if !iterator.init {
 		if !iterator.tree.Next() {
@@ -131,18 +147,22 @@ func (iterator *MemoryIterator) Next() bool {
 	return true
 }
 
+// Key returns the key of the current pair pointer.
 func (iterator *MemoryIterator) Key() []byte {
 	return iterator.key
 }
 
+// Value returns the value of the current pair pointer.
 func (iterator *MemoryIterator) Value() []byte {
 	return iterator.value
 }
 
+// Index implements an in-memory key-offset map.
 type Index struct {
 	*redblacktree.Tree
 }
 
+// Get returns the offset associated with the given key.
 func (index *Index) Get(key []byte) (int64, bool) {
 	floor, ok := index.Tree.Floor(key)
 	if !ok {
@@ -151,6 +171,7 @@ func (index *Index) Get(key []byte) (int64, bool) {
 	return floor.Value.(int64), true
 }
 
+// WriteTo serializes the index and writes it to the given stream in a binary format.
 func (index *Index) WriteTo(file io.Writer) (int64, error) {
 	var n int64
 	iterator := index.Iterator()
@@ -172,6 +193,7 @@ func (index *Index) WriteTo(file io.Writer) (int64, error) {
 	return n, nil
 }
 
+// ReadFrom deserializes the given binary stream and stores all read key-offset pairs in the index.
 func (index *Index) ReadFrom(file io.Reader) (int64, error) {
 	var n, keyLen int64
 	for binary.Read(file, binary.LittleEndian, &keyLen) == nil {
@@ -189,11 +211,13 @@ func (index *Index) ReadFrom(file io.Reader) (int64, error) {
 	return n, nil
 }
 
+// NewIndex constructs a new key-offset index.
 func NewIndex() *Index {
 	tree := redblacktree.NewWith(byteComparator)
 	return &Index{tree}
 }
 
+// byteComparator implements a comparator for byte slices.
 var byteComparator = utils.Comparator(func(a, b interface{}) int {
 	return bytes.Compare(a.([]byte), b.([]byte))
 })
