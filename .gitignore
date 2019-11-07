@@ -1,0 +1,5 @@
+.vscode
+*.index
+*.table
+*.filter
+*.log
