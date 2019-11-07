@@ -7,14 +7,23 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 
 	"valar/godat/pkg/store/table/index"
 
 	"github.com/golang/snappy"
+	"github.com/juju/ratelimit"
 	"github.com/ncw/directio"
+	"github.com/sirupsen/logrus"
 )
+
+var logger = logrus.New()
+
+func init() {
+	logger.SetLevel(logrus.DebugLevel)
+}
 
 const (
 	logSuffix    = ".log"
@@ -26,15 +35,17 @@ const (
 	MaxBlockSize = 2 << 16
 	// MaxCacheSize defines the maximum number of blocks cached in memory. By default 8 MiB.
 	MaxCacheSize = 128
+
+	defaultCompactRate = float64(2 << 21)
+	defaultCompactCap  = int64(2 << 22)
 )
 
 type Memtable struct {
 	Name string
 	Size int64
 
-	log       *File
-	mem       *index.Memory
-	memaccess sync.RWMutex
+	log *File
+	mem *index.Memory
 }
 
 type File struct {
@@ -42,43 +53,70 @@ type File struct {
 	sync.Mutex
 }
 
+func (memtable *Memtable) ReadFrom(cached io.Reader) (int64, error) {
+	// Read until nothing available
+	var keyLen, valueLen, bytesRead int64
+	for binary.Read(cached, binary.LittleEndian, &keyLen) == nil {
+		if bytesRead%1_000_000 == 0 {
+			logger.WithFields(logrus.Fields{
+				"name":      memtable.Name,
+				"bytesRead": bytesRead,
+			}).Debug("load memtable from disk")
+		}
+		bytesRead += 8
+		// Read value len
+		if err := binary.Read(cached, binary.LittleEndian, &valueLen); err != nil && err != io.EOF {
+			return bytesRead, fmt.Errorf("failed to read value len: %v", err)
+		} else if err == io.EOF {
+			return bytesRead, nil
+		}
+		bytesRead += 8
+		// Read key
+		key := make([]byte, keyLen)
+		if _, err := cached.Read(key); err != nil && err != io.EOF {
+			return bytesRead, fmt.Errorf("failed to read key, expected len %d: %v", keyLen, err)
+		} else if err == io.EOF {
+			return bytesRead, nil
+		}
+		bytesRead += keyLen
+		// Read value
+		value := make([]byte, valueLen)
+		if _, err := cached.Read(value); err != nil && err != io.EOF {
+			return bytesRead, fmt.Errorf("failed to read value: %v", err)
+		} else if err == io.EOF {
+			return bytesRead, nil
+		}
+		bytesRead += valueLen
+		memtable.mem.Put(key, value)
+	}
+	return bytesRead, nil
+}
+
 func NewMemtable(name string) (*Memtable, error) {
-	log, err := directio.OpenFile(name+logSuffix, os.O_CREATE|os.O_RDWR, 0644)
-	if err != nil {
+	cached, err := os.OpenFile(name+logSuffix, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil && !os.IsNotExist(err) {
 		return nil, err
 	}
 	Memtable := &Memtable{
 		Name: name,
-		log:  &File{File: log},
 		mem:  index.NewMemory(),
 	}
-	// Read until nothing available
-	var keyLen, valueLen int64
-	for binary.Read(log, binary.LittleEndian, &keyLen) == nil {
-		// Read value len
-		if err := binary.Read(log, binary.LittleEndian, &valueLen); err != nil {
-			return nil, err
-		}
-		// Read key
-		key := make([]byte, keyLen)
-		if _, err := log.Read(key); err != nil {
-			return nil, err
-		}
-		// Read value
-		value := make([]byte, valueLen)
-		if _, err := log.Read(value); err != nil {
-			return nil, err
-		}
-		Memtable.mem.Put(key, value)
-		Memtable.Size += 16 + keyLen + valueLen
+	Memtable.Size, err = Memtable.ReadFrom(cached)
+	if err != nil {
+		cached.Close()
+		return nil, fmt.Errorf("failed to load file %s: %v", name, err)
 	}
+	cached.Close()
+	log, err := directio.OpenFile(name+logSuffix, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		return nil, err
+	}
+	Memtable.log = &File{File: log}
 	return Memtable, nil
 }
 
 func (table *Memtable) Get(key []byte) [][]byte {
-	table.memaccess.RLock()
 	values := table.mem.Get(key)
-	table.memaccess.RUnlock()
 	return values
 }
 
@@ -106,9 +144,7 @@ func (table *Memtable) Put(key, value []byte) error {
 	if err := table.commit(key, value); err != nil {
 		return err
 	}
-	table.memaccess.Lock()
 	table.mem.Put(key, value)
-	table.memaccess.Unlock()
 	return nil
 }
 
@@ -116,27 +152,26 @@ func (table *Memtable) Merge(newer *Memtable) error {
 	// Copy all log entries to this table
 	newer.log.Lock()
 	defer newer.log.Unlock()
-	newer.log.Seek(0, 0)
-	_, err := io.Copy(table.log, newer.log)
-	if err != nil {
-		return err
-	}
 	// Remove old log file
+	// Copy memory conents
+	size := newer.mem.Size()
+	iterator := newer.mem.Iterator()
+	for index := 0; iterator.Next(); index++ {
+		if index%10000 == 0 {
+			logger.WithFields(logrus.Fields{
+				"from":     newer.Name,
+				"into":     table.Name,
+				"progress": float64(index) / float64(size),
+			}).Debug("merge memtables")
+		}
+		table.Put(iterator.Key(), iterator.Value())
+	}
 	if err := newer.Close(); err != nil {
 		return err
 	}
 	if err := newer.Cleanup(); err != nil {
 		return err
 	}
-	// Copy memory conents
-	table.memaccess.Lock()
-	newer.memaccess.RLock()
-	iterator := newer.mem.Iterator()
-	for iterator.Next() {
-		table.mem.Put(iterator.Key(), iterator.Value())
-	}
-	newer.memaccess.RUnlock()
-	table.memaccess.Unlock()
 	return nil
 }
 
@@ -145,15 +180,20 @@ func (table *Memtable) Close() error {
 }
 
 func (table *Memtable) Compact() error {
-	compacted, err := OpenWritable(table.Name)
+	compacted, err := OpenWritableWithRateLimit(table.Name, defaultCompactRate, defaultCompactCap)
 	if err != nil {
 		return err
 	}
 	defer compacted.Close()
-	table.memaccess.RLock()
-	defer table.memaccess.RUnlock()
+	count := table.mem.Size()
 	iterator := table.mem.Iterator()
-	for iterator.Next() {
+	for index := 0; iterator.Next(); index++ {
+		if index%10000 == 0 {
+			logger.WithFields(logrus.Fields{
+				"name":     table.Name,
+				"progress": float64(index) / float64(count),
+			}).Debug("compact memtable")
+		}
 		if err := compacted.Append(iterator.Key(), iterator.Value()); err != nil {
 			return err
 		}
@@ -166,8 +206,6 @@ func (table *Memtable) Cleanup() error {
 }
 
 func (table *Memtable) All() []MemtableRecord {
-	table.memaccess.RLock()
-	defer table.memaccess.RUnlock()
 	records := make([]MemtableRecord, table.mem.Size())
 	iterator := table.mem.SetIterator()
 	for index := 0; iterator.Next(); index++ {
@@ -230,8 +268,51 @@ func Open(name string) (*Table, error) {
 	return table, nil
 }
 
-// OpenGlob opens a slice of tables identified by a common prefix.
-func OpenGlob(glob string) ([]*Table, error) {
+func OpenMemtable(prefix, name string) (*Memtable, error) {
+	matches, err := filepath.Glob(fmt.Sprintf("%s*%s", prefix, logSuffix))
+	if err != nil {
+		return nil, err
+	}
+	memtable, err := NewMemtable(name)
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(matches)
+	for _, table := range matches {
+		logger.WithFields(logrus.Fields{
+			"from": table,
+			"into": name,
+		}).Debug("merge memtables")
+		old, err := NewMemtable(strings.TrimSuffix(table, logSuffix))
+		if err != nil {
+			return nil, err
+		}
+		if err := memtable.Merge(old); err != nil {
+			return nil, err
+		}
+	}
+	return memtable, nil
+}
+
+func RemoveIntermediateTables(prefix string) error {
+	matches, err := filepath.Glob(fmt.Sprintf("%s*%s", prefix, tableSuffix))
+	if err != nil {
+		return err
+	}
+	for _, table := range matches {
+		log := strings.TrimSuffix(table, tableSuffix) + logSuffix
+		if _, err := os.Stat(log); os.IsNotExist(err) {
+			continue
+		}
+		if err := os.Remove(table); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// OpenTables opens a slice of tables identified by a common prefix.
+func OpenTables(glob string) ([]*Table, error) {
 	matches, err := filepath.Glob(fmt.Sprintf("%s*%s", glob, tableSuffix))
 	if err != nil {
 		return nil, err
@@ -312,9 +393,10 @@ func (table *Table) Scan() *TableScanner {
 type WritableTable struct {
 	Index  *index.Index
 	Filter *index.Filter
-	File   *os.File
+	File   io.Writer
 	Name   string
 
+	disk   *os.File
 	buffer *bytes.Buffer
 	size   int64
 }
@@ -392,7 +474,7 @@ func (table *WritableTable) Close() error {
 	if err := table.FlushIndex(); err != nil {
 		return err
 	}
-	return table.File.Close()
+	return table.disk.Close()
 }
 
 func OpenWritable(name string) (*WritableTable, error) {
@@ -405,11 +487,28 @@ func OpenWritable(name string) (*WritableTable, error) {
 		Index:  index.NewIndex(),
 		File:   file,
 		Name:   name,
+		disk:   file,
 		buffer: bytes.NewBuffer(make([]byte, 0, MaxBlockSize)),
 	}, nil
 }
 
-func sort(a, b []byte) ([]byte, []byte) {
+func OpenWritableWithRateLimit(name string, refill float64, cap int64) (*WritableTable, error) {
+	file, err := os.Create(name + tableSuffix)
+	if err != nil {
+		return nil, err
+	}
+	writer := ratelimit.Writer(file, ratelimit.NewBucketWithRate(refill, cap))
+	return &WritableTable{
+		Filter: index.NewFilter(),
+		Index:  index.NewIndex(),
+		File:   writer,
+		Name:   name,
+		disk:   file,
+		buffer: bytes.NewBuffer(make([]byte, 0, MaxBlockSize)),
+	}, nil
+}
+
+func minmax(a, b []byte) ([]byte, []byte) {
 	switch bytes.Compare(a, b) {
 	case -1:
 		return a, b
@@ -436,7 +535,7 @@ func Merge(name string, left *Table, right *Table) error {
 	for ls.Peek() && rs.Peek() {
 		switch bytes.Compare(ls.Key(), rs.Key()) {
 		case 0:
-			min, max := sort(ls.Value(), rs.Value())
+			min, max := minmax(ls.Value(), rs.Value())
 			if err := table.Append(ls.Key(), min); err != nil {
 				return err
 			}
