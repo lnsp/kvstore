@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"io"
+	"sync"
 
 	"github.com/emirpasic/gods/sets/treeset"
 	"github.com/emirpasic/gods/trees/redblacktree"
@@ -44,37 +45,69 @@ func NewFilter() *Filter {
 // Memory is an in-memory key-valueset store.
 type Memory struct {
 	*redblacktree.Tree
+	mu sync.RWMutex
+}
+
+type ValueSet struct {
+	*treeset.Set
+	mu sync.RWMutex
+}
+
+func NewValueSet() *ValueSet {
+	return &ValueSet{
+		Set: treeset.NewWith(byteComparator),
+	}
+}
+
+func (set *ValueSet) Add(value []byte) {
+	set.mu.Lock()
+	set.Set.Add(value)
+	set.mu.Unlock()
+}
+
+func (set *ValueSet) Values() [][]byte {
+	set.mu.RLock()
+	values := make([][]byte, set.Set.Size())
+	it := set.Set.Iterator()
+	for i := 0; it.Next(); i++ {
+		values[i] = it.Value().([]byte)
+	}
+	set.mu.RUnlock()
+	return values
 }
 
 // NewMemory initializes a new in-memory key-valueset store.
 func NewMemory() *Memory {
 	tree := redblacktree.NewWith(byteComparator)
-	return &Memory{tree}
+	return &Memory{
+		Tree: tree,
+	}
 }
 
 // Put stores the given key-value pair in the in-memory tree.
 func (memory *Memory) Put(key []byte, value []byte) {
+	memory.mu.Lock()
 	node, ok := memory.Tree.Get(key)
 	if !ok {
-		node = treeset.NewWith(byteComparator)
+		node = NewValueSet()
 		memory.Tree.Put(key, node)
 	}
-	set := node.(*treeset.Set)
+	memory.mu.Unlock()
+	set := node.(*ValueSet)
 	set.Add(value)
 }
 
 // Get returns the valueset for the given key.
 func (memory *Memory) Get(key []byte) [][]byte {
+	memory.mu.RLock()
 	node, ok := memory.Tree.Get(key)
 	if !ok {
+		memory.mu.RUnlock()
 		return nil
 	}
-	set := node.(*treeset.Set)
-	values := make([][]byte, set.Size())
-	for i, v := range set.Values() {
-		values[i] = v.([]byte)
-	}
-	return values
+	memory.mu.RUnlock()
+	set := node.(*ValueSet)
+	return set.Values()
 }
 
 // Iterator returns an abstraction to iterate through all key-value pairs in the tree.
@@ -108,12 +141,7 @@ func (iterator *MemorySetIterator) Key() []byte {
 
 // Values returns the pair's valueset.
 func (iterator *MemorySetIterator) Values() [][]byte {
-	values := iterator.tree.Value().(*treeset.Set).Values()
-	bytes := make([][]byte, len(values))
-	for i, v := range values {
-		bytes[i] = v.([]byte)
-	}
-	return bytes
+	return iterator.tree.Value().(*ValueSet).Values()
 }
 
 // MemoryIterator implements an iterator for scanning through key-value pairs.
@@ -130,13 +158,13 @@ func (iterator *MemoryIterator) Next() bool {
 		if !iterator.tree.Next() {
 			return false
 		}
-		iterator.set = iterator.tree.Value().(*treeset.Set).Iterator()
+		iterator.set = iterator.tree.Value().(*ValueSet).Iterator()
 		iterator.key = iterator.tree.Key().([]byte)
 		iterator.init = true
 	}
 	next := iterator.set.Next()
 	for !next && iterator.tree.Next() {
-		iterator.set = iterator.tree.Value().(*treeset.Set).Iterator()
+		iterator.set = iterator.tree.Value().(*ValueSet).Iterator()
 		iterator.key = iterator.tree.Key().([]byte)
 		next = iterator.set.Next()
 	}
