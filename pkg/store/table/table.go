@@ -123,17 +123,22 @@ func (table *Memtable) Get(key []byte) [][]byte {
 func (table *Memtable) commit(key, value []byte) error {
 	table.log.Lock()
 	defer table.log.Unlock()
+	buffer := new(bytes.Buffer)
 	keyLen, valueLen := int64(len(key)), int64(len(value))
-	if err := binary.Write(table.log, binary.LittleEndian, keyLen); err != nil {
+	if err := binary.Write(buffer, binary.LittleEndian, keyLen); err != nil {
 		return err
 	}
-	if err := binary.Write(table.log, binary.LittleEndian, valueLen); err != nil {
+	if err := binary.Write(buffer, binary.LittleEndian, valueLen); err != nil {
 		return err
 	}
-	if _, err := table.log.Write(key); err != nil {
+	if _, err := buffer.Write(key); err != nil {
 		return err
 	}
-	if _, err := table.log.Write(value); err != nil {
+	if _, err := buffer.Write(value); err != nil {
+		return err
+	}
+	// Commit
+	if _, err := table.log.Write(buffer.Bytes()); err != nil {
 		return err
 	}
 	table.Size += 16 + keyLen + valueLen
