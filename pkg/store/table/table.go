@@ -232,6 +232,9 @@ type Table struct {
 	Name string
 	File *File
 
+	// Table key range
+	begin, end []byte
+
 	// Performance optimizations
 	Index  *index.Index
 	Filter *index.Filter
@@ -269,6 +272,9 @@ func Open(name string) (*Table, error) {
 	defer filterFile.Close()
 	if _, err := table.Filter.ReadFrom(filterFile); err != nil {
 		return table, err
+	}
+	if err := table.determineKeyRange(); err != nil {
+		return table, fmt.Errorf("failed to determine key range: %v", err)
 	}
 	return table, nil
 }
@@ -336,6 +342,31 @@ func OpenTables(glob string) ([]*Table, error) {
 // Close closes a table file.
 func (table *Table) Close() error {
 	return table.File.Close()
+}
+
+func (table *Table) determineKeyRange() error {
+	// Get first key
+	iterator := table.Index.Iterator()
+	if !iterator.First() {
+		return fmt.Errorf("failed to find first block")
+	}
+	table.begin = iterator.Key().([]byte)
+	// Seek last block, last entry
+	if !iterator.Last() {
+		return fmt.Errorf("failed to find last block")
+	}
+	endOffset := iterator.Value().(int64)
+	block, _, ok := Seek(table.File, endOffset)
+	if !ok {
+		return fmt.Errorf("failed to load last block")
+	}
+	scanner := RowScanner{
+		block: block,
+	}
+	for scanner.Next() {
+		table.end = scanner.Key()
+	}
+	return nil
 }
 
 func (table *Table) seek(key []byte) ([]byte, bool) {
@@ -788,4 +819,8 @@ func (scanner *TableScanner) Key() []byte {
 
 func (scanner *TableScanner) Value() []byte {
 	return scanner.value
+}
+
+type Run struct {
+	index *index.RunIndex
 }
