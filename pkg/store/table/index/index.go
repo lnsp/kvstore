@@ -185,6 +185,15 @@ func (iterator *MemoryIterator) Value() []byte {
 	return iterator.value
 }
 
+type RunIndex struct {
+	*redblacktree.Tree
+}
+
+func NewRunIndex() *RunIndex {
+	tree := redblacktree.NewWith(byteComparator)
+	return &RunIndex{tree}
+}
+
 // Index implements an in-memory key-offset map.
 type Index struct {
 	*redblacktree.Tree
