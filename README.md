@@ -11,9 +11,9 @@ The goal is to build an interstellar-scale key-value storage based on gossiping 
 - [x] Block level caching
 - [x] Block level compression/decompression
 - [x] Table-level access conflict resolution
-- [ ] Row-level access conflict resolution
+- [x] Row-level access conflict resolution
 - [x] Automatic memtable flushing on overflow
-- [ ] Automatic table merging on overflow
+- [ ] Automatic table merging on overflow using leveled compaction
 - [ ] HTTP-based access protocol
 - [ ] Peer-to-peer networking
 - [ ] Network-level conflict resolution
