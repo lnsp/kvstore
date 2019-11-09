@@ -17,7 +17,7 @@ func init() {
 	logger.SetLevel(logrus.DebugLevel)
 }
 
-const MaxMemSize = 2 << 27
+const MaxMemSize = 2 << 26
 
 func tableName(name string) string {
 	return fmt.Sprintf("%s-%s", name, time.Now().UTC().Format("2006-02-01-15-04-05"))
