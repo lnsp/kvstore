@@ -180,20 +180,15 @@ func (table *Memtable) Close() error {
 func (table *Memtable) Compact() error {
 	compacted, err := OpenWritableWithRateLimit(table.Name, defaultCompactRate, defaultCompactCap)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to open writable table: %v", err)
 	}
 	defer compacted.Close()
-	count := table.mem.Size()
-	iterator := table.mem.Iterator()
+	iterator := table.mem.SetIterator()
 	for index := 0; iterator.Next(); index++ {
-		if index%10000 == 0 {
-			logger.WithFields(logrus.Fields{
-				"name":     table.Name,
-				"progress": float64(index) / float64(count),
-			}).Debug("compact memtable")
-		}
-		if err := compacted.Append(iterator.Key(), iterator.Value()); err != nil {
-			return err
+		values := iterator.Values()
+		n := len(values)
+		if err := compacted.Append(iterator.Key(), values[n-1]); err != nil {
+			return fmt.Errorf("failed to compact key %v: %v", iterator.Key(), err)
 		}
 	}
 	return nil
