@@ -1,6 +1,6 @@
-# Godat
+# kv
 
-This repository contains the source of Godat, a flexible associative data store baed on string-sorted tables.
+This repository contains the source of kv, a flexible associative data store baed on string-sorted tables.
 The goal is to build an interstellar-scale key-value storage based on gossiping and a unique time system.
 
 ## What's working?

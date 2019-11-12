@@ -1,10 +1,11 @@
-module valar/godat
+module valar/kv
 
 go 1.13
 
 require (
 	github.com/emirpasic/gods v1.12.0
 	github.com/golang/snappy v0.0.1
+	github.com/google/uuid v1.1.1
 	github.com/hashicorp/golang-lru v0.5.3
 	github.com/juju/ratelimit v1.0.1
 	github.com/ncw/directio v1.0.5

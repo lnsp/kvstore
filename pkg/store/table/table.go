@@ -9,7 +9,7 @@ import (
 	"sort"
 	"strings"
 
-	"valar/godat/pkg/store/table/index"
+	"valar/kv/pkg/store/table/index"
 
 	"github.com/golang/snappy"
 	"github.com/juju/ratelimit"

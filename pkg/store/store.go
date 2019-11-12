@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"sync"
 	"time"
-	"valar/godat/pkg/store/table"
+	"valar/kv/pkg/store/table"
 
 	"github.com/sirupsen/logrus"
 )
@@ -81,7 +81,7 @@ type Store struct {
 	flush mutex
 
 	active, flushed *table.Memtable
-	tables          []*table.Table
+	compaction      *table.Leveled
 }
 
 func New(name string) (*Store, error) {

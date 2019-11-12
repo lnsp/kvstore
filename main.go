@@ -1,34 +1,18 @@
 package main
 
 import (
-	"flag"
 	"fmt"
-	"log"
 	"math/rand"
 	"os"
-	"runtime/pprof"
+	"os/signal"
+	"syscall"
 	"time"
-
-	"valar/godat/pkg/store"
+	"valar/kv/pkg/store"
 )
 
 func main() {
-	var cpuprofile = flag.String("cpuprofile", "", "write cpu profile to `file`")
-	flag.Parse()
-	if *cpuprofile != "" {
-		f, err := os.Create(*cpuprofile)
-		if err != nil {
-			log.Fatal("could not create CPU profile: ", err)
-		}
-		defer f.Close()
-		if err := pprof.StartCPUProfile(f); err != nil {
-			log.Fatal("could not start CPU profile: ", err)
-		}
-		defer pprof.StopCPUProfile()
-	}
-
 	if err := run(); err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
 }
@@ -47,17 +31,26 @@ func (t task) String() string {
 }
 
 func run() error {
+	// Notify on kill
+	cancel := make(chan os.Signal, 1)
+	stop := make(chan bool)
+	signal.Notify(cancel, syscall.SIGINT, syscall.SIGKILL, syscall.SIGTERM)
+	// Open local database
 	db, err := store.New("local")
 	if err != nil {
 		return err
 	}
-	defer db.Close()
-	wq := func(q <-chan task) {
-		for task := range q {
-			if task.action < 1 {
-				db.Put(task.key, &store.Record{Time: rand.Int63n(1024), Value: task.value})
-			} else {
-				db.Get(task.key)
+	wq := func(tasks <-chan task) {
+		for {
+			select {
+			case task := <-tasks:
+				if task.action < 1 {
+					db.Put(task.key, &store.Record{Time: rand.Int63n(1024), Value: task.value})
+				} else {
+					db.Get(task.key)
+				}
+			case <-stop:
+				return
 			}
 		}
 	}
@@ -68,6 +61,12 @@ func run() error {
 	// fuzzy testing
 	delta := time.Now()
 	for i := 0; ; i++ {
+		select {
+		case <-cancel:
+			close(stop)
+			return db.Close()
+		default:
+		}
 		key := make([]byte, 8)
 		rand.Read(key)
 		value := make([]byte, 8)
@@ -79,38 +78,4 @@ func run() error {
 			delta = time.Now()
 		}
 	}
-	/*
-		fmt.Print("> ")
-		scanner := bufio.NewScanner(os.Stdin)
-		for scanner.Scan() {
-			line := scanner.Text()
-			args := strings.Split(line, " ")
-			switch strings.ToLower(args[0]) {
-			case "put":
-				key, value := []byte(args[1]), []byte(args[2])
-				db.Put(key, &store.Record{
-					Time:  time.Now().UTC().Unix(),
-					Value: value,
-				})
-			case "get":
-				key := []byte(args[1])
-				for i := 0; i < 10; i++ {
-					go func(i int) {
-						records := db.Get(key)
-						for _, r := range records {
-							fmt.Println(i, r)
-						}
-					}(i)
-				}
-			case "flush":
-				if err := db.Flush(); err != nil {
-					fmt.Println("error:", err)
-				}
-			case "exit":
-				return nil
-			}
-			fmt.Print("> ")
-		}
-	*/
-	return nil
 }
