@@ -4,12 +4,10 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync"
 
 	"valar/godat/pkg/store/table/index"
 
@@ -24,6 +22,8 @@ func init() {
 	logger.SetLevel(logrus.DebugLevel)
 }
 
+var DefaultBucket = ratelimit.NewBucketWithRate(2<<21, 2<<22)
+
 const (
 	logSuffix    = ".log"
 	tableSuffix  = ".table"
@@ -34,183 +34,7 @@ const (
 	MaxBlockSize = 2 << 16
 	// MaxCacheSize defines the maximum number of blocks cached in memory. By default 8 MiB.
 	MaxCacheSize = 128
-
-	defaultCompactRate = float64(2 << 21)
-	defaultCompactCap  = int64(2 << 22)
 )
-
-type Memtable struct {
-	Name string
-	Size int64
-
-	log *File
-	mem *index.Memory
-}
-
-type File struct {
-	*os.File
-	sync.Mutex
-}
-
-func (memtable *Memtable) ReadFrom(cached io.Reader) (int64, error) {
-	// Read until nothing available
-	var keyLen, valueLen, bytesRead int64
-	for binary.Read(cached, binary.LittleEndian, &keyLen) == nil {
-		if bytesRead%1_000_000 == 0 {
-			logger.WithFields(logrus.Fields{
-				"name":      memtable.Name,
-				"bytesRead": bytesRead,
-			}).Debug("load memtable from disk")
-		}
-		bytesRead += 8
-		// Read value len
-		if err := binary.Read(cached, binary.LittleEndian, &valueLen); err != nil && err != io.EOF {
-			return bytesRead, fmt.Errorf("failed to read value len: %v", err)
-		} else if err == io.EOF {
-			return bytesRead, nil
-		}
-		bytesRead += 8
-		// Read key
-		key := make([]byte, keyLen)
-		if _, err := cached.Read(key); err != nil && err != io.EOF {
-			return bytesRead, fmt.Errorf("failed to read key, expected len %d: %v", keyLen, err)
-		} else if err == io.EOF {
-			return bytesRead, nil
-		}
-		bytesRead += keyLen
-		// Read value
-		value := make([]byte, valueLen)
-		if _, err := cached.Read(value); err != nil && err != io.EOF {
-			return bytesRead, fmt.Errorf("failed to read value: %v", err)
-		} else if err == io.EOF {
-			return bytesRead, nil
-		}
-		bytesRead += valueLen
-		memtable.mem.Put(key, value)
-	}
-	return bytesRead, nil
-}
-
-func NewMemtable(name string) (*Memtable, error) {
-	cached, err := os.OpenFile(name+logSuffix, os.O_CREATE|os.O_RDWR, 0644)
-	if err != nil && !os.IsNotExist(err) {
-		return nil, err
-	}
-	Memtable := &Memtable{
-		Name: name,
-		mem:  index.NewMemory(),
-	}
-	Memtable.Size, err = Memtable.ReadFrom(cached)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load file %s: %v", name, err)
-	}
-	Memtable.log = &File{File: cached}
-	return Memtable, nil
-}
-
-func (table *Memtable) Get(key []byte) [][]byte {
-	values := table.mem.Get(key)
-	return values
-}
-
-func (table *Memtable) commit(key, value []byte) error {
-	table.log.Lock()
-	defer table.log.Unlock()
-	buffer := new(bytes.Buffer)
-	keyLen, valueLen := int64(len(key)), int64(len(value))
-	if err := binary.Write(buffer, binary.LittleEndian, keyLen); err != nil {
-		return err
-	}
-	if err := binary.Write(buffer, binary.LittleEndian, valueLen); err != nil {
-		return err
-	}
-	if _, err := buffer.Write(key); err != nil {
-		return err
-	}
-	if _, err := buffer.Write(value); err != nil {
-		return err
-	}
-	// Commit
-	if _, err := table.log.Write(buffer.Bytes()); err != nil {
-		return err
-	}
-	table.Size += 16 + keyLen + valueLen
-	return nil
-}
-
-func (table *Memtable) Put(key, value []byte) error {
-	if err := table.commit(key, value); err != nil {
-		return err
-	}
-	table.mem.Put(key, value)
-	return nil
-}
-
-func (table *Memtable) Merge(newer *Memtable) error {
-	// Copy all log entries to this table
-	newer.log.Lock()
-	defer newer.log.Unlock()
-	// Remove old log file
-	// Copy memory conents
-	size := newer.mem.Size()
-	iterator := newer.mem.Iterator()
-	for index := 0; iterator.Next(); index++ {
-		if index%10000 == 0 {
-			logger.WithFields(logrus.Fields{
-				"from":     newer.Name,
-				"into":     table.Name,
-				"progress": float64(index) / float64(size),
-			}).Debug("merge memtables")
-		}
-		table.Put(iterator.Key(), iterator.Value())
-	}
-	if err := newer.Close(); err != nil {
-		return err
-	}
-	if err := newer.Cleanup(); err != nil {
-		return err
-	}
-	return nil
-}
-
-func (table *Memtable) Close() error {
-	return table.log.Close()
-}
-
-func (table *Memtable) Compact() error {
-	compacted, err := OpenWritableWithRateLimit(table.Name, defaultCompactRate, defaultCompactCap)
-	if err != nil {
-		return fmt.Errorf("failed to open writable table: %v", err)
-	}
-	defer compacted.Close()
-	iterator := table.mem.SetIterator()
-	for index := 0; iterator.Next(); index++ {
-		values := iterator.Values()
-		n := len(values)
-		if err := compacted.Append(iterator.Key(), values[n-1]); err != nil {
-			return fmt.Errorf("failed to compact key %v: %v", iterator.Key(), err)
-		}
-	}
-	return nil
-}
-
-func (table *Memtable) Cleanup() error {
-	return os.Remove(table.Name + logSuffix)
-}
-
-func (table *Memtable) All() []MemtableRecord {
-	records := make([]MemtableRecord, table.mem.Size())
-	iterator := table.mem.SetIterator()
-	for index := 0; iterator.Next(); index++ {
-		records[index] = MemtableRecord{iterator.Key(), iterator.Values()}
-	}
-	return records
-}
-
-type MemtableRecord struct {
-	Key    []byte
-	Values [][]byte
-}
 
 // Table is a key-sorted list of key-value pairs stored on disk.
 // It is backed by multiple performance and size optimizations, such as
@@ -221,7 +45,7 @@ type Table struct {
 	File *File
 
 	// Table key range
-	begin, end []byte
+	Begin, End []byte
 
 	// Performance optimizations
 	Index  *index.Index
@@ -332,13 +156,31 @@ func (table *Table) Close() error {
 	return table.File.Close()
 }
 
+// Delete closes a table file and removes it from disk.
+func (table *Table) Delete() error {
+	if err := table.File.Close(); err != nil {
+		return err
+	}
+	// Delete table, index and filter
+	if err := os.Remove(table.Name + tableSuffix); err != nil {
+		return err
+	}
+	if err := os.Remove(table.Name + filterSuffix); err != nil {
+		return err
+	}
+	if err := os.Remove(table.Name + indexSuffix); err != nil {
+		return err
+	}
+	return nil
+}
+
 func (table *Table) determineKeyRange() error {
 	// Get first key
 	iterator := table.Index.Iterator()
 	if !iterator.First() {
 		return fmt.Errorf("failed to find first block")
 	}
-	table.begin = iterator.Key().([]byte)
+	table.Begin = iterator.Key().([]byte)
 	// Seek last block, last entry
 	if !iterator.Last() {
 		return fmt.Errorf("failed to find last block")
@@ -352,9 +194,13 @@ func (table *Table) determineKeyRange() error {
 		block: block,
 	}
 	for scanner.Next() {
-		table.end = scanner.Key()
+		table.End = scanner.Key()
 	}
 	return nil
+}
+
+func (table *Table) Range(key []byte) bool {
+	return bytes.Compare(key, table.Begin) >= 0 && bytes.Compare(key, table.End) <= 0
 }
 
 func (table *Table) seek(key []byte) ([]byte, bool) {
@@ -412,126 +258,6 @@ func (table *Table) Scan() *TableScanner {
 	}
 }
 
-// WritableTable is an unfinished table in write mode.
-// Values can only be written by increasing key order.
-type WritableTable struct {
-	Index  *index.Index
-	Filter *index.Filter
-	File   io.Writer
-	Name   string
-
-	disk   *os.File
-	buffer *bytes.Buffer
-	size   int64
-}
-
-func (table *WritableTable) Append(key, value []byte) error {
-	// Append record to table
-	keyLen := len(key)
-	valueLen := len(value)
-	totalLen := 4 + keyLen + valueLen
-	// Check for flush
-	if table.buffer.Len()+totalLen > MaxBlockSize {
-		if err := table.Flush(); err != nil {
-			return err
-		}
-	}
-	// Check for index
-	if table.buffer.Len() == 0 {
-		table.Index.Put(key, table.size)
-	}
-	// Add to filter
-	table.Filter.Add(key)
-	// Write to buffer
-	if err := binary.Write(table.buffer, binary.LittleEndian, uint16(keyLen)); err != nil {
-		return err
-	}
-	if err := binary.Write(table.buffer, binary.LittleEndian, uint16(valueLen)); err != nil {
-		return err
-	}
-	table.buffer.Write(key)
-	table.buffer.Write(value)
-	return nil
-}
-
-func (table *WritableTable) Flush() error {
-	compressedBlock := snappy.Encode(nil, table.buffer.Bytes())
-	compressedBlockSize := uint64(len(compressedBlock))
-	if err := binary.Write(table.File, binary.LittleEndian, compressedBlockSize); err != nil {
-		return err
-	}
-	if _, err := table.File.Write(compressedBlock); err != nil {
-		return err
-	}
-	table.size += 8 + int64(compressedBlockSize)
-	table.buffer.Reset()
-	return nil
-}
-
-func (table *WritableTable) FlushFilter() error {
-	filterFile, err := os.Create(table.Name + filterSuffix)
-	if err != nil {
-		return err
-	}
-	defer filterFile.Close()
-	_, err = table.Filter.WriteTo(filterFile)
-	return err
-}
-
-func (table *WritableTable) FlushIndex() error {
-	indexFile, err := os.Create(table.Name + indexSuffix)
-	if err != nil {
-		return err
-	}
-	defer indexFile.Close()
-	_, err = table.Index.WriteTo(indexFile)
-	return err
-}
-
-func (table *WritableTable) Close() error {
-	if err := table.Flush(); err != nil {
-		return err
-	}
-	if err := table.FlushFilter(); err != nil {
-		return err
-	}
-	if err := table.FlushIndex(); err != nil {
-		return err
-	}
-	return table.disk.Close()
-}
-
-func OpenWritable(name string) (*WritableTable, error) {
-	file, err := os.Create(name + tableSuffix)
-	if err != nil {
-		return nil, err
-	}
-	return &WritableTable{
-		Filter: index.NewFilter(),
-		Index:  index.NewIndex(),
-		File:   file,
-		Name:   name,
-		disk:   file,
-		buffer: bytes.NewBuffer(make([]byte, 0, MaxBlockSize)),
-	}, nil
-}
-
-func OpenWritableWithRateLimit(name string, refill float64, cap int64) (*WritableTable, error) {
-	file, err := os.Create(name + tableSuffix)
-	if err != nil {
-		return nil, err
-	}
-	writer := ratelimit.Writer(file, ratelimit.NewBucketWithRate(refill, cap))
-	return &WritableTable{
-		Filter: index.NewFilter(),
-		Index:  index.NewIndex(),
-		File:   writer,
-		Name:   name,
-		disk:   file,
-		buffer: bytes.NewBuffer(make([]byte, 0, MaxBlockSize)),
-	}, nil
-}
-
 func minmax(a, b []byte) ([]byte, []byte) {
 	switch bytes.Compare(a, b) {
 	case -1:
@@ -559,10 +285,7 @@ func Merge(name string, left *Table, right *Table) error {
 	for ls.Peek() && rs.Peek() {
 		switch bytes.Compare(ls.Key(), rs.Key()) {
 		case 0:
-			min, max := minmax(ls.Value(), rs.Value())
-			if err := table.Append(ls.Key(), min); err != nil {
-				return err
-			}
+			_, max := minmax(ls.Value(), rs.Value())
 			if err := table.Append(ls.Key(), max); err != nil {
 				return err
 			}
@@ -667,176 +390,4 @@ func Next(block []byte, offset int64) ([]byte, []byte, int64, bool) {
 		valueEnd   = valueStart + int64(valueLen)
 	)
 	return block[keyStart:valueStart], block[valueStart:valueEnd], valueEnd - offset, true
-}
-
-// ScanRows returns a row scanner for the given block.
-func ScanRows(block []byte) RowScanner {
-	return RowScanner{
-		block: block,
-	}
-}
-
-// ScanBlocks returns a block scanner for the given file.
-func ScanBlocks(file *File) BlockScanner {
-	return BlockScanner{
-		file:   file,
-		offset: 0,
-		block:  nil,
-	}
-}
-
-type BlockScanner struct {
-	file           *File
-	block          []byte
-	peeked, offset int64
-}
-
-func (scanner *BlockScanner) Next() bool {
-	scanner.Skip()
-	block, offset, ok := Seek(scanner.file, scanner.offset)
-	if !ok {
-		return false
-	}
-	scanner.block = block
-	scanner.offset += offset
-	return true
-}
-
-func (scanner *BlockScanner) Peek() bool {
-	block, offset, ok := Seek(scanner.file, scanner.offset)
-	if !ok {
-		return false
-	}
-	scanner.block = block
-	scanner.peeked = offset
-	return true
-}
-
-func (scanner *BlockScanner) Skip() {
-	scanner.offset += scanner.peeked
-	scanner.peeked = 0
-}
-
-func (scanner *BlockScanner) Block() []byte {
-	return scanner.block
-}
-
-type RowScanner struct {
-	block, key, value []byte
-	peeked, offset    int64
-}
-
-func (scanner *RowScanner) Next() bool {
-	scanner.Skip()
-	key, value, offset, ok := Next(scanner.block, scanner.offset)
-	if !ok {
-		return false
-	}
-	scanner.key = key
-	scanner.value = value
-	scanner.offset += offset
-	return true
-}
-
-func (scanner *RowScanner) Peek() bool {
-	key, value, offset, ok := Next(scanner.block, scanner.offset)
-	if !ok {
-		return false
-	}
-	scanner.key = key
-	scanner.value = value
-	scanner.peeked = offset
-	return true
-}
-
-func (scanner *RowScanner) Skip() {
-	scanner.offset += scanner.peeked
-	scanner.peeked = 0
-}
-
-func (scanner *RowScanner) Key() []byte {
-	return scanner.key
-}
-
-func (scanner *RowScanner) Value() []byte {
-	return scanner.value
-}
-
-type Scanner interface {
-	Next() bool
-	Key() []byte
-	Value() []byte
-}
-
-type TableScanner struct {
-	block BlockScanner
-	row   RowScanner
-
-	key, value []byte
-}
-
-func (scanner *TableScanner) Next() bool {
-	next := scanner.row.Next()
-	for !next && scanner.block.Next() {
-		scanner.row = ScanRows(scanner.block.Block())
-		next = scanner.row.Next()
-	}
-	scanner.key = scanner.row.Key()
-	scanner.value = scanner.row.Value()
-	return next
-}
-
-func (scanner *TableScanner) Peek() bool {
-	next := scanner.row.Peek()
-	for !next && scanner.block.Next() {
-		scanner.row = ScanRows(scanner.block.Block())
-		next = scanner.row.Peek()
-	}
-	scanner.key = scanner.row.Key()
-	scanner.value = scanner.row.Value()
-	return next
-}
-
-func (scanner *TableScanner) Skip() {
-	scanner.row.Skip()
-}
-
-func (scanner *TableScanner) Key() []byte {
-	return scanner.key
-}
-
-func (scanner *TableScanner) Value() []byte {
-	return scanner.value
-}
-
-type Leveled struct {
-	BaseSize    int
-	LevelSize   int
-	LevelFactor int
-	Base        []*Table
-	Levels      []Run
-}
-
-func (compaction *Leveled) Add(table *Table) error {
-	compaction.Base = append(compaction.Base, table)
-	if len(compaction.Base) > compaction.BaseSize {
-		return compaction.Push()
-	}
-	return nil
-}
-
-func (compaction *Leveled) Push() error {
-	return nil
-}
-
-type Run struct {
-	*index.RunIndex
-	MaxSize int
-}
-
-func NewRun(max int) *Run {
-	return &Run{
-		RunIndex: index.NewRunIndex(),
-		MaxSize:  max,
-	}
 }
