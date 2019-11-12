@@ -2,8 +2,8 @@ package table
 
 import (
 	"fmt"
+	"strconv"
 
-	"github.com/google/uuid"
 	"github.com/juju/ratelimit"
 )
 
@@ -29,7 +29,7 @@ func OpenWritableWithAutoflush(name string, size int64, bucket *ratelimit.Bucket
 func (table *WritableAutoflushTable) Append(key, value []byte) error {
 	// Check if table needs to be initialized
 	if table.active == nil {
-		name := table.Basename + uuid.New().String()
+		name := table.Basename + "-" + strconv.Itoa(len(table.Written))
 		table.Written = append(table.Written, name)
 		new, err := OpenWritableWithRateLimit(name, table.ratelimit)
 		if err != nil {
