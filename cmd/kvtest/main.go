@@ -7,7 +7,8 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
-	"valar/kv/pkg/store"
+
+	store "github.com/lnsp/kvstore"
 )
 
 func main() {

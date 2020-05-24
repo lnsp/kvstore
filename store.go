@@ -6,7 +6,8 @@ import (
 	"fmt"
 	"sync"
 	"time"
-	"valar/kv/pkg/store/table"
+
+	"github.com/lnsp/kvstore/table"
 
 	"github.com/sirupsen/logrus"
 )
@@ -80,6 +81,7 @@ type Store struct {
 	// flush synchronizes all write-actions related to the flushed memtable.
 	flush mutex
 
+	tables          []*table.Table
 	active, flushed *table.Memtable
 	compaction      *table.Leveled
 }
@@ -111,6 +113,7 @@ func (store *Store) Restore() error {
 			return err
 		}
 	}
+
 	// Remove all tables with matching logs
 	store.tables, err = table.OpenTables(store.Name)
 	if err != nil {

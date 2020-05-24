@@ -6,7 +6,8 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"valar/kv/pkg/store/table/index"
+
+	"github.com/lnsp/kvstore/table/index"
 
 	"github.com/sirupsen/logrus"
 )

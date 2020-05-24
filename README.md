@@ -1,7 +1,6 @@
-# kv
+# kvstore
 
-This repository contains the source of kv, a flexible associative data store baed on string-sorted tables.
-The goal is to build an interstellar-scale key-value storage based on gossiping and a unique time system.
+This repository contains the source of kvstore, a flexible associative data store based on string-sorted tables. It is supposed to be easily embeddable into any application.
 
 ## What's working?
 
@@ -13,8 +12,4 @@ The goal is to build an interstellar-scale key-value storage based on gossiping 
 - [x] Table-level access conflict resolution
 - [x] Row-level access conflict resolution
 - [x] Automatic memtable flushing on overflow
-- [ ] Automatic table merging on overflow using leveled compaction
-- [ ] HTTP-based access protocol
-- [ ] Peer-to-peer networking
-- [ ] Network-level conflict resolution
-- [ ] Global timestamp clock
+- [x] Automatic table merging on overflow using leveled compaction
