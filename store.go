@@ -18,7 +18,7 @@ func init() {
 	logger.SetLevel(logrus.DebugLevel)
 }
 
-const MaxMemSize = 2 << 26
+const MaxMemSize = 2 << 25
 
 func tableName(name string) string {
 	return fmt.Sprintf("%s-%s", name, time.Now().UTC().Format("2006-02-01-15-04-05"))
@@ -77,19 +77,19 @@ type Store struct {
 	Name string
 
 	// access synchronizes all actions related to the active memtable.
-	memory, disk sync.RWMutex
+	memory sync.RWMutex
 	// flush synchronizes all write-actions related to the flushed memtable.
 	flush mutex
 
-	tables          []*table.Table
 	active, flushed *table.Memtable
 	compaction      *table.Leveled
 }
 
 func New(name string) (*Store, error) {
 	store := &Store{
-		Name:  name,
-		flush: makeMutex(),
+		Name:       name,
+		flush:      makeMutex(),
+		compaction: table.NewLeveledCompaction(name),
 	}
 	if err := store.Restore(); err != nil {
 		return nil, err
@@ -113,11 +113,12 @@ func (store *Store) Restore() error {
 			return err
 		}
 	}
-
-	// Remove all tables with matching logs
-	store.tables, err = table.OpenTables(store.Name)
+	tables, err := table.OpenTables(store.Name)
 	if err != nil {
 		return err
+	}
+	if err := store.compaction.Restore(tables); err != nil {
+		return fmt.Errorf("failed to restore tables: %w", err)
 	}
 	return nil
 }
@@ -173,6 +174,13 @@ func (store *Store) Flush() error {
 		store.mergeFlushed()
 		return err
 	}
+	if err := store.compaction.Add(flushed); err != nil {
+		logger.WithFields(logrus.Fields{
+			"name": store.flushed.Name,
+		}).WithError(err).Error("Failed to push flushed to leveled compaction, merging back")
+		store.mergeFlushed()
+		return err
+	}
 	store.flushed.Close()
 	store.flushed.Cleanup()
 	logger.WithFields(logrus.Fields{
@@ -181,15 +189,13 @@ func (store *Store) Flush() error {
 	// Add flushed table to tables
 	store.memory.Lock()
 	store.flushed = nil
-	store.disk.Lock()
-	store.tables = append(store.tables, flushed)
-	store.disk.Unlock()
 	store.memory.Unlock()
 	return nil
 }
 
 func (store *Store) Close() error {
 	store.memory.Lock()
+	defer store.memory.Unlock()
 	if err := store.active.Compact(); err != nil {
 		return err
 	}
@@ -199,14 +205,9 @@ func (store *Store) Close() error {
 	if err := store.active.Cleanup(); err != nil {
 		return err
 	}
-	store.disk.Lock()
-	for _, table := range store.tables {
-		if err := table.Close(); err != nil {
-			return err
-		}
+	if err := store.compaction.Close(); err != nil {
+		return err
 	}
-	// After this, all PUT and GET operations on this
-	// table will lead to a deadlock.
 	return nil
 }
 
@@ -230,13 +231,7 @@ func (store *Store) collect(key []byte) [][]byte {
 		values = append(values, store.flushed.Get(key)...)
 	}
 	store.memory.RUnlock()
-	store.disk.RLock()
-	for _, t := range store.tables {
-		local := t.Get(key)
-		values = append(values, local...)
-	}
-	store.disk.RUnlock()
-	return values
+	return append(values, store.compaction.Get(key)...)
 }
 
 func (store *Store) Get(key []byte) []*Record {

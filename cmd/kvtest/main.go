@@ -9,6 +9,7 @@ import (
 	"time"
 
 	store "github.com/lnsp/kvstore"
+	"github.com/sirupsen/logrus"
 )
 
 func main() {
@@ -32,6 +33,7 @@ func (t task) String() string {
 }
 
 func run() error {
+	logrus.SetLevel(logrus.DebugLevel)
 	// Notify on kill
 	cancel := make(chan os.Signal, 1)
 	stop := make(chan bool)
@@ -74,7 +76,7 @@ func run() error {
 		rand.Read(value)
 		task := task{0, key, value}
 		tasks <- task
-		if i%10000 == 0 {
+		if i%100000 == 0 {
 			fmt.Println(i, task, time.Since(delta), db.MemSize())
 			delta = time.Now()
 		}

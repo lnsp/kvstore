@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -12,15 +13,17 @@ import (
 )
 
 const (
+	RunPrefix            = "level"
 	MaxTableCacheTime    = time.Minute
 	DefaultLeveledBase   = 5
 	DefaultLeveledCount  = 10
-	DefaultLeveledSize   = 2 << 24
+	DefaultLeveledSize   = 2 << 26
 	DefaultLeveledFactor = 10
 )
 
-func NewLeveledCompaction() *Leveled {
+func NewLeveledCompaction(name string) *Leveled {
 	return &Leveled{
+		Name:             name,
 		BaseSize:         DefaultLeveledSize,
 		BaseCount:        DefaultLeveledBase,
 		LevelSize:        DefaultLeveledSize,
@@ -31,6 +34,7 @@ func NewLeveledCompaction() *Leveled {
 }
 
 type Leveled struct {
+	Name                                    string
 	BaseSize, LevelSize, LevelSizeFactor    int64
 	BaseCount, LevelCount, LevelCountFactor int
 
@@ -38,6 +42,59 @@ type Leveled struct {
 	Levels []*Run
 
 	mu sync.RWMutex
+}
+
+func (compaction *Leveled) Restore(tables []*Table) error {
+	// Check if tables is prefixed
+	for _, table := range tables {
+		if strings.HasPrefix(table.Name, RunPrefix) {
+			// Find out which level
+			var level int
+			fmt.Sscanf(table.Name, compaction.Name+"-level%04d", &level)
+			for level >= len(compaction.Levels) {
+				compaction.Levels = append(compaction.Levels, &Run{
+					Name:     fmt.Sprintf("%s-level%04d", compaction.Name, len(compaction.Levels)),
+					MaxSize:  compaction.LevelSize,
+					MaxCount: compaction.LevelCount,
+				})
+				compaction.LevelSize *= compaction.LevelSizeFactor
+				compaction.LevelCount *= compaction.LevelCountFactor
+			}
+			if !compaction.Levels[level].Push(table) {
+				if err := compaction.Levels[level].Merge(table); err != nil {
+					return fmt.Errorf("add to level: %w", err)
+				}
+			}
+			logrus.WithFields(logrus.Fields{
+				"level": level,
+				"table": table.Name,
+			}).Debug("Add to leveled compaction")
+		} else {
+			if err := compaction.Add(table); err != nil {
+				return fmt.Errorf("add to compaction: %w", err)
+			}
+			logrus.WithFields(logrus.Fields{
+				"table": table.Name,
+			}).Debug("Add to base compaction")
+		}
+	}
+	return nil
+}
+
+func (compaction *Leveled) Close() error {
+	compaction.mu.Lock()
+	defer compaction.mu.Unlock()
+	for _, t := range compaction.Base {
+		if err := t.Close(); err != nil {
+			return err
+		}
+	}
+	for _, r := range compaction.Levels {
+		if err := r.Close(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (compaction *Leveled) Get(key []byte) [][]byte {
@@ -57,20 +114,42 @@ func (compaction *Leveled) Add(table *Table) error {
 	compaction.mu.Lock()
 	defer compaction.mu.Unlock()
 	compaction.Base = append(compaction.Base, table)
-	if len(compaction.Base) > compaction.BaseCount {
-		if err := compaction.rebalance(); err != nil {
-			return fmt.Errorf("leveled compaction rebalance: %v", err)
-		}
+	if err := compaction.rebalance(); err != nil {
+		return fmt.Errorf("leveled compaction rebalance: %v", err)
 	}
 	return nil
 }
 
+func (compaction *Leveled) nextLevel(table *Table) error {
+	level := len(compaction.Levels)
+	next := &Run{
+		Name:     fmt.Sprintf("%s-level%04d", compaction.Name, level),
+		MaxCount: compaction.LevelCount,
+		MaxSize:  compaction.LevelSize,
+	}
+	if err := next.Merge(table); err != nil {
+		return fmt.Errorf("merge into next level: %w", err)
+	}
+	compaction.Levels = append(compaction.Levels)
+	compaction.LevelCount *= compaction.LevelCountFactor
+	compaction.LevelSize *= compaction.LevelSizeFactor
+	return nil
+}
+
 // rebalance assumes that compaction has already been locked.
+// We first pick the merge victim from our Base slice.
+// Then try to merge it up the tree (as long as there are existing levels).
 func (compaction *Leveled) rebalance() error {
+	// Ignore if no rebalance needed
+	if len(compaction.Base) < 1 || len(compaction.Base) < compaction.BaseCount {
+		return nil
+	}
 	// Pick the first table
 	level := 0
 	victim := compaction.Base[0]
 	compaction.Base = compaction.Base[1:]
+	// Restore makes sure to append the victim back to the
+	// level it originally came from.
 	restore := func() {
 		if level == 0 {
 			compaction.Base = append(compaction.Base, victim)
@@ -78,34 +157,32 @@ func (compaction *Leveled) rebalance() error {
 		}
 		compaction.Levels[level-1].Push(victim)
 	}
-	for level < len(compaction.Levels) && victim != nil {
+	for level < len(compaction.Levels) {
 		// Merge victim with level
 		if err := compaction.Levels[level].Merge(victim); err != nil {
 			restore()
-			return fmt.Errorf("failed victim merge: %v", err)
+			return fmt.Errorf("failed victim merge: %w", err)
 		}
-		victim = nil
-		// Check for extradiction
+		// Remove old victim
+		if err := victim.Delete(); err != nil {
+			return fmt.Errorf("failed victim delete: %w", err)
+		}
+		// Check for extradiction, else we can return early
 		if compaction.Levels[level].Overflow() {
 			victim = compaction.Levels[level].Tables[0]
 			compaction.Levels[level].Tables = compaction.Levels[level].Tables[1:]
+		} else {
+			return nil
 		}
 		level++
 	}
-	// victim not nil => we are missing levels
-	if victim != nil {
-		next := &Run{
-			Name:     fmt.Sprintf("level%d", level),
-			MaxCount: compaction.LevelCount,
-			MaxSize:  compaction.LevelSize,
-		}
-		if err := next.Merge(victim); err != nil {
-			restore()
-			return fmt.Errorf("failed next level merge: %v", err)
-		}
-		compaction.Levels = append(compaction.Levels)
-		compaction.LevelCount *= compaction.LevelCountFactor
-		compaction.LevelSize *= compaction.LevelSizeFactor
+	// victim not nil, we need to append a new level
+	if err := compaction.nextLevel(victim); err != nil {
+		restore()
+		return fmt.Errorf("failed victim next level: %w", err)
+	}
+	if err := victim.Delete(); err != nil {
+		return fmt.Errorf("failed victim delete: %w", err)
 	}
 	return nil
 }
@@ -123,6 +200,7 @@ type Run struct {
 	garbage   []*Table
 }
 
+// Overflow returns true if there are more tables in the run than allowed.
 func (run *Run) Overflow() bool {
 	return len(run.Tables) > run.MaxCount
 }
@@ -183,15 +261,23 @@ func (run *Run) cleanup(tables []*Table) {
 
 // Push inserts a single table back into the run.
 // The table should have been evicted from the run beforehand.
-func (run *Run) Push(table *Table) {
+// If the table can not be inserted without violating the non-intersecting interval property
+// the function returns false.
+func (run *Run) Push(table *Table) bool {
 	run.access.Lock()
+	defer run.access.Unlock()
 	index := sort.Search(len(run.Tables), func(i int) bool {
 		return bytes.Compare(run.Tables[i].Begin, table.Begin) >= 0
 	})
+	if index < len(run.Tables)-1 {
+		if bytes.Compare(run.Tables[index+1].Begin, table.End) <= 0 {
+			return false
+		}
+	}
 	run.Tables = append(run.Tables, nil)
 	copy(run.Tables[index+1:], run.Tables[index:])
 	run.Tables[index] = table
-	run.access.Unlock()
+	return true
 }
 
 // Join inserts a table vector replacing the tables at the given range.
@@ -209,13 +295,11 @@ func (run *Run) generateAutoflushName() string {
 	return fmt.Sprintf("%s-%s-%s", run.Name, time.Now().UTC().Format("2006-02-01-15-04-05"), uuid.New().String())
 }
 
+// Merge merges the given table into the run.
 func (run *Run) Merge(table *Table) error {
-	// [0 - 4] [5 - 10] [11 - 19] [20 - 24] [25 - 30]
-	// [13 - 22]
 	begin := sort.Search(len(run.Tables), func(i int) bool {
 		return bytes.Compare(run.Tables[i].End, table.Begin) >= 0
 	})
-	// Begin should point to [11 - 19]
 	end := sort.Search(len(run.Tables), func(i int) bool {
 		return bytes.Compare(run.Tables[i].Begin, table.End) > 0
 	})
