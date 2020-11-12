@@ -2,16 +2,15 @@ package table
 
 import (
 	"bytes"
-	"encoding/binary"
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
+	"sync"
 
+	"github.com/lnsp/kvstore/table/block"
 	"github.com/lnsp/kvstore/table/index"
 
-	"github.com/golang/snappy"
 	"github.com/juju/ratelimit"
 	"github.com/sirupsen/logrus"
 )
@@ -30,11 +29,14 @@ const (
 	indexSuffix  = ".index"
 	filterSuffix = ".filter"
 
-	// MaxBlockSize defines the maximum size of a table block. By default 64 KiB.
-	MaxBlockSize = 2 << 16
 	// MaxCacheSize defines the maximum number of blocks cached in memory. By default 8 MiB.
 	MaxCacheSize = 128
 )
+
+type LockedFile struct {
+	*os.File
+	sync.Mutex
+}
 
 // Table is a key-sorted list of key-value pairs stored on disk.
 // It is backed by multiple performance and size optimizations, such as
@@ -42,7 +44,7 @@ const (
 // ARC cache for block accesses and RB tree based key indexing.
 type Table struct {
 	Name string
-	File *File
+	File *LockedFile
 
 	// Table key range
 	Begin, End []byte
@@ -53,7 +55,7 @@ type Table struct {
 	Cache  *index.Cache
 
 	// mfile is reserved for merge operations.
-	mfile *File
+	mfile *LockedFile
 }
 
 // Open a table-triple and initializes the table file and loads index and filter into memory.
@@ -64,7 +66,7 @@ func Open(name string) (*Table, error) {
 	}
 	table := &Table{
 		Name:   name,
-		File:   &File{File: tableFile},
+		File:   &LockedFile{File: tableFile},
 		Index:  index.NewIndex(),
 		Filter: index.NewFilter(),
 		Cache:  index.NewCache(MaxCacheSize),
@@ -89,49 +91,6 @@ func Open(name string) (*Table, error) {
 		return table, fmt.Errorf("failed to determine key range: %v", err)
 	}
 	return table, nil
-}
-
-func OpenMemtable(prefix, name string) (*Memtable, error) {
-	matches, err := filepath.Glob(fmt.Sprintf("%s*%s", prefix, logSuffix))
-	if err != nil {
-		return nil, err
-	}
-	memtable, err := NewMemtable(name)
-	if err != nil {
-		return nil, err
-	}
-	sort.Strings(matches)
-	for _, table := range matches {
-		logger.WithFields(logrus.Fields{
-			"from": table,
-			"into": name,
-		}).Debug("merge memtables")
-		old, err := NewMemtable(strings.TrimSuffix(table, logSuffix))
-		if err != nil {
-			return nil, err
-		}
-		if err := memtable.Merge(old); err != nil {
-			return nil, err
-		}
-	}
-	return memtable, nil
-}
-
-func RemoveIntermediateTables(prefix string) error {
-	matches, err := filepath.Glob(fmt.Sprintf("%s*%s", prefix, tableSuffix))
-	if err != nil {
-		return err
-	}
-	for _, table := range matches {
-		log := strings.TrimSuffix(table, tableSuffix) + logSuffix
-		if _, err := os.Stat(log); os.IsNotExist(err) {
-			continue
-		}
-		if err := os.Remove(table); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 // OpenTables opens a slice of tables identified by a common prefix.
@@ -174,11 +133,14 @@ func (table *Table) Delete() error {
 	return nil
 }
 
+// determineKeyRange calculates the key range this table covers.
 func (table *Table) determineKeyRange() error {
 	// Get first key
 	iterator := table.Index.Iterator()
 	if !iterator.First() {
-		return fmt.Errorf("failed to find first block")
+		table.Begin = []byte{}
+		table.End = []byte{}
+		return nil
 	}
 	table.Begin = iterator.Key().([]byte)
 	// Seek last block, last entry
@@ -186,12 +148,12 @@ func (table *Table) determineKeyRange() error {
 		return fmt.Errorf("failed to find last block")
 	}
 	endOffset := iterator.Value().(int64)
-	block, _, ok := Seek(table.File, endOffset)
+	b, _, ok := block.Seek(table.File, endOffset)
 	if !ok {
 		return fmt.Errorf("failed to load last block")
 	}
 	scanner := RowScanner{
-		block: block,
+		block: b,
 	}
 	for scanner.Next() {
 		table.End = scanner.Key()
@@ -199,7 +161,8 @@ func (table *Table) determineKeyRange() error {
 	return nil
 }
 
-func (table *Table) Range(key []byte) bool {
+// InRange returns if the table may contain the given key.
+func (table *Table) InRange(key []byte) bool {
 	return bytes.Compare(key, table.Begin) >= 0 && bytes.Compare(key, table.End) <= 0
 }
 
@@ -214,14 +177,14 @@ func (table *Table) seek(key []byte) ([]byte, bool) {
 		return nil, false
 	}
 	// Check if block in cache
-	block, ok := table.Cache.Get(offset)
+	b, ok := table.Cache.Get(offset)
 	if !ok {
-		block, _, ok = Seek(table.File, offset)
+		b, _, ok = block.Seek(table.File, offset)
 		if ok {
-			table.Cache.Add(offset, block)
+			table.Cache.Add(offset, b)
 		}
 	}
-	return block.([]byte), ok
+	return b.([]byte), ok
 }
 
 func (table *Table) openMerge() (*TableScanner, error) {
@@ -229,10 +192,10 @@ func (table *Table) openMerge() (*TableScanner, error) {
 	if err != nil {
 		return nil, err
 	}
-	table.mfile = &File{File: file}
+	table.mfile = &LockedFile{File: file}
 	return &TableScanner{
 		block: BlockScanner{
-			file: table.mfile,
+			input: table.mfile,
 		},
 	}, nil
 }
@@ -243,17 +206,18 @@ func (table *Table) closeMerge() error {
 
 // Get returns the matching value to a key.
 func (table *Table) Get(key []byte) [][]byte {
-	block, ok := table.seek(key)
+	b, ok := table.seek(key)
 	if !ok {
 		return nil
 	}
-	return Find(block, key)
+	return block.FindRow(b, key)
 }
 
+// Scan returns a scanner that scans through the table.
 func (table *Table) Scan() *TableScanner {
 	return &TableScanner{
 		block: BlockScanner{
-			file: table.File,
+			input: table.File,
 		},
 	}
 }
@@ -268,8 +232,8 @@ func minmax(a, b []byte) ([]byte, []byte) {
 }
 
 // Merge combines two tables into one.
-func Merge(name string, left *Table, right *Table) error {
-	table, err := OpenWritable(name)
+func Merge(path string, left *Table, right *Table, bucket *ratelimit.Bucket) error {
+	table, err := NewWTable(path, bucket)
 	if err != nil {
 		return err
 	}
@@ -316,78 +280,4 @@ func Merge(name string, left *Table, right *Table) error {
 		rs.Skip()
 	}
 	return nil
-}
-
-func seekCompressedBlock(file *File, offset int64) ([]byte, int64, bool) {
-	file.Lock()
-	defer file.Unlock()
-	// Seek to offset
-	if _, err := file.Seek(offset, os.SEEK_SET); err != nil {
-		return nil, 0, false
-	}
-	var compressedBlockSize int64
-	if err := binary.Read(file, binary.LittleEndian, &compressedBlockSize); err != nil {
-		return nil, 0, false
-	}
-	// Read block and decompress it
-	compressedBlock := make([]byte, compressedBlockSize)
-	if _, err := file.Read(compressedBlock); err != nil {
-		return nil, 0, false
-	}
-	return compressedBlock, 8 + compressedBlockSize, true
-}
-
-// Seek searches the file for a block at the given offset.
-func Seek(file *File, offset int64) ([]byte, int64, bool) {
-	compressedBlock, size, ok := seekCompressedBlock(file, offset)
-	if !ok {
-		return nil, 0, false
-	}
-	block, err := snappy.Decode(nil, compressedBlock)
-	if err != nil {
-		return nil, 0, false
-	}
-	return block, size, true
-}
-
-// Find looks for a row with the given key in the block.
-func Find(block, key []byte) [][]byte {
-	var (
-		offset = int64(0)
-		size   = int64(len(block))
-		scan   = true
-		values = make([][]byte, 0, 1)
-	)
-	for offset < size && scan {
-		var (
-			keyLen     = binary.LittleEndian.Uint16(block[offset : offset+2])
-			valueLen   = binary.LittleEndian.Uint16(block[offset+2 : offset+4])
-			keyStart   = offset + 4
-			valueStart = keyStart + int64(keyLen)
-			valueEnd   = valueStart + int64(valueLen)
-		)
-		switch bytes.Compare(key, block[keyStart:valueStart]) {
-		case 0:
-			values = append(values, block[valueStart:valueEnd])
-		case 1:
-			scan = false
-		}
-		offset = valueEnd
-	}
-	return values
-}
-
-// Next reads the next row from the block and returns the key, value and offset.
-func Next(block []byte, offset int64) ([]byte, []byte, int64, bool) {
-	if offset >= int64(len(block)) {
-		return nil, nil, offset, false
-	}
-	var (
-		keyLen     = binary.LittleEndian.Uint16(block[offset : offset+2])
-		valueLen   = binary.LittleEndian.Uint16(block[offset+2 : offset+4])
-		keyStart   = offset + 4
-		valueStart = keyStart + int64(keyLen)
-		valueEnd   = valueStart + int64(valueLen)
-	)
-	return block[keyStart:valueStart], block[valueStart:valueEnd], valueEnd - offset, true
 }

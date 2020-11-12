@@ -1,12 +1,12 @@
 package store
 
 import (
-	"bytes"
-	"encoding/binary"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
-	"time"
 
+	"github.com/google/uuid"
 	"github.com/lnsp/kvstore/table"
 
 	"github.com/sirupsen/logrus"
@@ -14,36 +14,11 @@ import (
 
 var logger = logrus.New()
 
-func init() {
-	logger.SetLevel(logrus.DebugLevel)
-}
+// This is about 64MiB.
+const maxMemtableSize = 1 << 26
 
-const MaxMemSize = 2 << 25
-
-func tableName(name string) string {
-	return fmt.Sprintf("%s-%s", name, time.Now().UTC().Format("2006-02-01-15-04-05"))
-}
-
-type Record struct {
-	Time  int64
-	Value []byte
-}
-
-func (record Record) String() string {
-	return fmt.Sprintf("%s [%d]", string(record.Value), record.Time)
-}
-
-func (record *Record) FromBytes(data []byte) {
-	buffer := bytes.NewBuffer(data)
-	binary.Read(buffer, binary.BigEndian, &record.Time)
-	record.Value = buffer.Bytes()
-}
-
-func (record *Record) Bytes() []byte {
-	buffer := new(bytes.Buffer)
-	binary.Write(buffer, binary.BigEndian, record.Time)
-	buffer.Write(record.Value)
-	return buffer.Bytes()
+func tableName(prefix string) string {
+	return fmt.Sprintf("%s-%s", prefix, uuid.New())
 }
 
 type mutex struct {
@@ -74,7 +49,7 @@ func makeMutex() mutex {
 }
 
 type Store struct {
-	Name string
+	Path string
 
 	// access synchronizes all actions related to the active memtable.
 	memory sync.RWMutex
@@ -85,11 +60,16 @@ type Store struct {
 	compaction      *table.Leveled
 }
 
-func New(name string) (*Store, error) {
+// New creates a new store.
+func New(path string) (*Store, error) {
+	// Ensure that directory exists
+	if err := os.MkdirAll(path, 0755); err != nil {
+		return nil, fmt.Errorf("ensure path exists: %w", err)
+	}
 	store := &Store{
-		Name:       name,
+		Path:       path,
 		flush:      makeMutex(),
-		compaction: table.NewLeveledCompaction(name),
+		compaction: table.NewLeveledCompaction(filepath.Join(path, "leveled")),
 	}
 	if err := store.Restore(); err != nil {
 		return nil, err
@@ -97,23 +77,25 @@ func New(name string) (*Store, error) {
 	return store, nil
 }
 
+// Restore restores the old store's state.
 func (store *Store) Restore() error {
 	// Remove intermediate tables
-	err := table.RemoveIntermediateTables(store.Name)
+	err := table.RemovePartialTables(store.Path)
 	if err != nil {
 		return err
 	}
 	// Load new memtable
-	store.active, err = table.OpenMemtable(store.Name, tableName(store.Name))
+	memtablePath := filepath.Join(store.Path, "mem")
+	store.active, err = table.OpenMemtable(memtablePath, tableName("mem"))
 	if err != nil {
 		return err
 	}
-	if store.active.Size >= MaxMemSize {
+	if store.active.Size >= maxMemtableSize {
 		if err := store.Flush(); err != nil {
 			return err
 		}
 	}
-	tables, err := table.OpenTables(store.Name)
+	tables, err := table.OpenTables(store.compaction.Name)
 	if err != nil {
 		return err
 	}
@@ -142,7 +124,7 @@ func (store *Store) Flush() error {
 	store.flush.TryLock()
 	// Lock any "flush" related activities
 	defer store.flush.Unlock()
-	replace, err := table.NewMemtable(tableName(store.Name))
+	replace, err := table.NewMemtable(tableName("mem"))
 	if err != nil {
 		return err
 	}
@@ -211,6 +193,7 @@ func (store *Store) Close() error {
 	return nil
 }
 
+// Put stores a key-value pair.
 func (store *Store) Put(key []byte, record *Record) error {
 	// Lock in-memory table write access.
 	store.memory.Lock()
@@ -218,7 +201,7 @@ func (store *Store) Put(key []byte, record *Record) error {
 	if err := store.active.Put(key, record.Bytes()); err != nil {
 		return err
 	}
-	if store.active.Size >= MaxMemSize && store.flush.TryLock() {
+	if store.active.Size >= maxMemtableSize && store.flush.TryLock() {
 		go store.Flush()
 	}
 	return nil
@@ -234,9 +217,10 @@ func (store *Store) collect(key []byte) [][]byte {
 	return append(values, store.compaction.Get(key)...)
 }
 
-func (store *Store) Get(key []byte) []*Record {
+func (store *Store) Get(key []byte) []table.Record {
 	values := store.collect(key)
-	records := make([]*Record, len(values))
+	records := make([]table.Record, len(values))
+	// Only return record with highest version
 	for i, v := range values {
 		rec := &Record{}
 		rec.FromBytes(v)

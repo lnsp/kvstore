@@ -6,7 +6,6 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	store "github.com/lnsp/kvstore"
 	"github.com/sirupsen/logrus"
@@ -37,9 +36,9 @@ func run() error {
 	// Notify on kill
 	cancel := make(chan os.Signal, 1)
 	stop := make(chan bool)
-	signal.Notify(cancel, syscall.SIGINT, syscall.SIGKILL, syscall.SIGTERM)
+	signal.Notify(cancel, syscall.SIGINT, syscall.SIGTERM)
 	// Open local database
-	db, err := store.New("local")
+	db, err := store.New("store/")
 	if err != nil {
 		return err
 	}
@@ -62,23 +61,18 @@ func run() error {
 		go wq(tasks)
 	}
 	// fuzzy testing
-	delta := time.Now()
-	for i := 0; ; i++ {
+	for {
 		select {
 		case <-cancel:
 			close(stop)
 			return db.Close()
 		default:
 		}
-		key := make([]byte, 8)
+		key := make([]byte, 2)
 		rand.Read(key)
 		value := make([]byte, 8)
 		rand.Read(value)
 		task := task{0, key, value}
 		tasks <- task
-		if i%100000 == 0 {
-			fmt.Println(i, task, time.Since(delta), db.MemSize())
-			delta = time.Now()
-		}
 	}
 }

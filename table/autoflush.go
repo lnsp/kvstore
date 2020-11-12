@@ -2,47 +2,56 @@ package table
 
 import (
 	"fmt"
-	"strconv"
+	"sync"
 
 	"github.com/juju/ratelimit"
 )
 
-type WritableAutoflushTable struct {
-	Basename string
-	MaxSize  int64
-	Written  []string
+// AFTable is a appendable key-value list that automatically flushes itself to the file system.
+type AFTable struct {
+	Path    string
+	MaxSize int64
 
-	ratelimit *ratelimit.Bucket
-	active    *WritableTable
+	RateLimit *ratelimit.Bucket
+
+	// mu protects the fields below.
+	mu     sync.Mutex
+	active *WTable
+	index  int
 }
 
-func OpenWritableWithAutoflush(name string, size int64, bucket *ratelimit.Bucket) *WritableAutoflushTable {
-	return &WritableAutoflushTable{
-		Basename: name,
-		MaxSize:  size,
+// NewAFTable creates a new AFTable.
+func NewAFTable(path string, size int64, limit *ratelimit.Bucket) *AFTable {
+	return &AFTable{
+		Path:      path,
+		MaxSize:   size,
+		RateLimit: limit,
 
-		active:    nil,
-		ratelimit: bucket,
+		active: nil,
+		index:  0,
 	}
 }
 
-func (table *WritableAutoflushTable) Append(key, value []byte) error {
+// Append appends a key-value pair to the AFTable.
+func (table *AFTable) Append(key, value []byte) error {
+	table.mu.Lock()
+	defer table.mu.Unlock()
 	// Check if table needs to be initialized
 	if table.active == nil {
-		name := table.Basename + "-" + strconv.Itoa(len(table.Written))
-		table.Written = append(table.Written, name)
-		new, err := OpenWritableWithRateLimit(name, table.ratelimit)
+		name := fmt.Sprintf("%s-%d", table.index)
+		new, err := NewWTable(name, table.RateLimit)
 		if err != nil {
-			return fmt.Errorf("failed to setup new autoflush table: %v", err)
+			return fmt.Errorf("setup new autoflush table: %v", err)
 		}
 		table.active = new
+		table.index++
 	}
 	// Append record
 	if err := table.active.Append(key, value); err != nil {
-		return fmt.Errorf("failed to append to autoflush table: %v", err)
+		return fmt.Errorf("append to autoflush table: %v", err)
 	}
 	// Check if table is too big, flush and replace if required
-	if table.active.Size >= table.MaxSize {
+	if table.active.Size() >= table.MaxSize {
 		if err := table.active.Close(); err != nil {
 			return err
 		}
@@ -51,7 +60,8 @@ func (table *WritableAutoflushTable) Append(key, value []byte) error {
 	return nil
 }
 
-func (table *WritableAutoflushTable) Close() error {
+// Close closes the AFTable.
+func (table *AFTable) Close() error {
 	if table.active != nil {
 		err := table.active.Close()
 		table.active = nil

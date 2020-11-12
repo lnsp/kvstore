@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	RunPrefix            = "level"
+	RunPrefix            = "run"
 	MaxTableCacheTime    = time.Minute
 	DefaultLeveledBase   = 5
 	DefaultLeveledCount  = 10
@@ -47,13 +47,13 @@ type Leveled struct {
 func (compaction *Leveled) Restore(tables []*Table) error {
 	// Check if tables is prefixed
 	for _, table := range tables {
-		if strings.HasPrefix(table.Name, RunPrefix) {
+		if strings.HasPrefix(table.Name, fmt.Sprintf("%s-%s", compaction.Name, RunPrefix)) {
 			// Find out which level
 			var level int
-			fmt.Sscanf(table.Name, compaction.Name+"-level%04d", &level)
+			fmt.Sscanf(table.Name, compaction.Name+"-%s%04d", &level)
 			for level >= len(compaction.Levels) {
 				compaction.Levels = append(compaction.Levels, &Run{
-					Name:     fmt.Sprintf("%s-level%04d", compaction.Name, len(compaction.Levels)),
+					Name:     fmt.Sprintf("%s-%s%04d", compaction.Name, RunPrefix, len(compaction.Levels)),
 					MaxSize:  compaction.LevelSize,
 					MaxCount: compaction.LevelCount,
 				})
@@ -123,7 +123,7 @@ func (compaction *Leveled) Add(table *Table) error {
 func (compaction *Leveled) nextLevel(table *Table) error {
 	level := len(compaction.Levels)
 	next := &Run{
-		Name:     fmt.Sprintf("%s-level%04d", compaction.Name, level),
+		Name:     fmt.Sprintf("%s-%s%04d", compaction.Name, RunPrefix, level),
 		MaxCount: compaction.LevelCount,
 		MaxSize:  compaction.LevelSize,
 	}
@@ -220,6 +220,7 @@ func (run *Run) Get(key []byte) [][]byte {
 	return run.Tables[n].Get(key)
 }
 
+// Close closes a run.
 func (run *Run) Close() error {
 	run.collector.Lock()
 	for _, t := range run.garbage {
@@ -248,6 +249,7 @@ func (run *Run) cleanup(tables []*Table) {
 		for _, t := range run.garbage {
 			if err := t.Delete(); err != nil {
 				logger.WithError(err).Warn("failed to close garbage table")
+				continue
 			}
 			logger.WithFields(logrus.Fields{
 				"table": t.Name,
@@ -297,6 +299,7 @@ func (run *Run) generateAutoflushName() string {
 
 // Merge merges the given table into the run.
 func (run *Run) Merge(table *Table) error {
+	// Find overlapping tables
 	begin := sort.Search(len(run.Tables), func(i int) bool {
 		return bytes.Compare(run.Tables[i].End, table.Begin) >= 0
 	})
@@ -315,7 +318,7 @@ func (run *Run) Merge(table *Table) error {
 	for i := begin; i < end; i++ {
 		iterators[i-begin] = run.Tables[i].Scan()
 	}
-	autoflush := OpenWritableWithAutoflush(run.generateAutoflushName(), run.MaxSize, DefaultBucket)
+	autoflush := NewAFTable(run.generateAutoflushName(), run.MaxSize, DefaultBucket)
 	defer autoflush.Close()
 	// Perform merge
 	for i := 0; i < len(iterators); i++ {
@@ -350,7 +353,7 @@ func (run *Run) Merge(table *Table) error {
 		return err
 	}
 	// Load all tables into run
-	tables, err := OpenTables(autoflush.Basename)
+	tables, err := OpenTables(autoflush.Name)
 	if err != nil {
 		return fmt.Errorf("failed to load merged tables: %v", err)
 	}

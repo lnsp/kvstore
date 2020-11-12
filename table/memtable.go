@@ -6,30 +6,76 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
 
 	"github.com/lnsp/kvstore/table/index"
-
 	"github.com/sirupsen/logrus"
 )
 
+// OpenMemtable opens a new memtable.
+func OpenMemtable(prefix, path string) (*Memtable, error) {
+	matches, err := filepath.Glob(fmt.Sprintf("%s*%s", prefix, logSuffix))
+	if err != nil {
+		return nil, err
+	}
+	memtable, err := NewMemtable(path)
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(matches)
+	for _, table := range matches {
+		logger.WithFields(logrus.Fields{
+			"from": table,
+			"into": path,
+		}).Debug("Merging memtables")
+		old, err := NewMemtable(strings.TrimSuffix(table, logSuffix))
+		if err != nil {
+			return nil, err
+		}
+		if err := memtable.Merge(old); err != nil {
+			return nil, err
+		}
+	}
+	return memtable, nil
+}
+
+// RemovePartialTables deletes all tables which have a log file attached to them.
+func RemovePartialTables(prefix string) error {
+	matches, err := filepath.Glob(fmt.Sprintf("%s*%s", prefix, tableSuffix))
+	if err != nil {
+		return err
+	}
+	for _, table := range matches {
+		log := strings.TrimSuffix(table, tableSuffix) + logSuffix
+		if _, err := os.Stat(log); os.IsNotExist(err) {
+			continue
+		}
+		if err := os.Remove(table); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Memtable is an in-memory key-value table.
 type Memtable struct {
 	Name string
 	Size int64
 
-	log *File
 	mem *index.Memory
+
+	// mu protects the fields below.
+	mu  sync.Mutex
+	log io.WriteCloser
 }
 
-func (memtable *Memtable) ReadFrom(cached io.Reader) (int64, error) {
+func (table *Memtable) ReadFrom(cached io.Reader) (int64, error) {
 	// Read until nothing available
 	var keyLen, valueLen, bytesRead int64
 	for binary.Read(cached, binary.LittleEndian, &keyLen) == nil {
-		if bytesRead%1_000_000 == 0 {
-			logger.WithFields(logrus.Fields{
-				"name":      memtable.Name,
-				"bytesRead": bytesRead,
-			}).Debug("load memtable from disk")
-		}
 		bytesRead += 8
 		// Read value len
 		if err := binary.Read(cached, binary.LittleEndian, &valueLen); err != nil && err != io.EOF {
@@ -54,36 +100,38 @@ func (memtable *Memtable) ReadFrom(cached io.Reader) (int64, error) {
 			return bytesRead, nil
 		}
 		bytesRead += valueLen
-		memtable.mem.Put(key, value)
+		table.mem.Put(key, value)
 	}
 	return bytesRead, nil
 }
 
+// NewMemtable initializes a new memtable.
 func NewMemtable(name string) (*Memtable, error) {
 	cached, err := os.OpenFile(name+logSuffix, os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil && !os.IsNotExist(err) {
 		return nil, err
 	}
-	Memtable := &Memtable{
+	t := &Memtable{
 		Name: name,
 		mem:  index.NewMemory(),
+		log:  cached,
 	}
-	Memtable.Size, err = Memtable.ReadFrom(cached)
+	t.Size, err = t.ReadFrom(cached)
 	if err != nil {
-		return nil, fmt.Errorf("failed to load file %s: %v", name, err)
+		return nil, fmt.Errorf("load memtable %s: %v", name, err)
 	}
-	Memtable.log = &File{File: cached}
-	return Memtable, nil
+	return t, nil
 }
 
+// Get returns the value associated with the key.
 func (table *Memtable) Get(key []byte) [][]byte {
 	values := table.mem.Get(key)
 	return values
 }
 
+// commit commits the entry to the memtable.
+// mu must be held.
 func (table *Memtable) commit(key, value []byte) error {
-	table.log.Lock()
-	defer table.log.Unlock()
 	buffer := new(bytes.Buffer)
 	keyLen, valueLen := int64(len(key)), int64(len(value))
 	if err := binary.Write(buffer, binary.LittleEndian, keyLen); err != nil {
@@ -106,7 +154,10 @@ func (table *Memtable) commit(key, value []byte) error {
 	return nil
 }
 
+// Put stores a key-value pair in the memtable.
 func (table *Memtable) Put(key, value []byte) error {
+	table.mu.Lock()
+	defer table.mu.Unlock()
 	if err := table.commit(key, value); err != nil {
 		return err
 	}
@@ -114,39 +165,40 @@ func (table *Memtable) Put(key, value []byte) error {
 	return nil
 }
 
+// Merge merges this memtable with a newer one.
 func (table *Memtable) Merge(newer *Memtable) error {
 	// Copy all log entries to this table
-	newer.log.Lock()
-	defer newer.log.Unlock()
-	// Remove old log file
+	newer.mu.Lock()
+	defer newer.mu.Unlock()
 	// Copy memory conents
-	size := newer.mem.Size()
 	iterator := newer.mem.Iterator()
 	for index := 0; iterator.Next(); index++ {
-		if index%10000 == 0 {
-			logger.WithFields(logrus.Fields{
-				"from":     newer.Name,
-				"into":     table.Name,
-				"progress": float64(index) / float64(size),
-			}).Debug("merge memtables")
+		key, value := iterator.Key(), iterator.Value()
+		if err := table.commit(key, value); err != nil {
+			return err
 		}
-		table.Put(iterator.Key(), iterator.Value())
+		table.mem.Put(key, value)
 	}
 	if err := newer.Close(); err != nil {
 		return err
 	}
+	// Remove old log file
 	if err := newer.Cleanup(); err != nil {
 		return err
 	}
 	return nil
 }
 
+// Close closes the memtable.
 func (table *Memtable) Close() error {
 	return table.log.Close()
 }
 
+// Compact compresses the memtable log to disk.
 func (table *Memtable) Compact() error {
-	compacted, err := OpenWritableWithRateLimit(table.Name, DefaultBucket)
+	table.mu.Lock()
+	defer table.mu.Unlock()
+	compacted, err := OpenAppentable(table.Name, DefaultBucket)
 	if err != nil {
 		return fmt.Errorf("failed to open writable table: %v", err)
 	}

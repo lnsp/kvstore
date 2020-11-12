@@ -1,6 +1,10 @@
 package table
 
-import "bytes"
+import (
+	"bytes"
+
+	"github.com/lnsp/kvstore/table/block"
+)
 
 // ScanRows returns a row scanner for the given block.
 func ScanRows(block []byte) RowScanner {
@@ -10,23 +14,24 @@ func ScanRows(block []byte) RowScanner {
 }
 
 // ScanBlocks returns a block scanner for the given file.
-func ScanBlocks(file *File) BlockScanner {
+func ScanBlocks(file block.ReadSeekLocker) BlockScanner {
 	return BlockScanner{
-		file:   file,
+		input:  file,
 		offset: 0,
 		block:  nil,
 	}
 }
 
+// BlockScanner implements a basic block scanner that iterates over a table block.
 type BlockScanner struct {
-	file           *File
+	input          block.ReadSeekLocker
 	block          []byte
 	peeked, offset int64
 }
 
 func (scanner *BlockScanner) Next() bool {
 	scanner.Skip()
-	block, offset, ok := Seek(scanner.file, scanner.offset)
+	block, offset, ok := block.Seek(scanner.input, scanner.offset)
 	if !ok {
 		return false
 	}
@@ -36,7 +41,7 @@ func (scanner *BlockScanner) Next() bool {
 }
 
 func (scanner *BlockScanner) Peek() bool {
-	block, offset, ok := Seek(scanner.file, scanner.offset)
+	block, offset, ok := block.Seek(scanner.input, scanner.offset)
 	if !ok {
 		return false
 	}
@@ -61,7 +66,7 @@ type RowScanner struct {
 
 func (scanner *RowScanner) Next() bool {
 	scanner.Skip()
-	key, value, offset, ok := Next(scanner.block, scanner.offset)
+	key, value, offset, ok := block.NextRow(scanner.block, scanner.offset)
 	if !ok {
 		return false
 	}
@@ -72,7 +77,7 @@ func (scanner *RowScanner) Next() bool {
 }
 
 func (scanner *RowScanner) Peek() bool {
-	key, value, offset, ok := Next(scanner.block, scanner.offset)
+	key, value, offset, ok := block.NextRow(scanner.block, scanner.offset)
 	if !ok {
 		return false
 	}
