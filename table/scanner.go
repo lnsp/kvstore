@@ -23,12 +23,14 @@ func ScanBlocks(file block.ReadSeekLocker) BlockScanner {
 }
 
 // BlockScanner implements a basic block scanner that iterates over a table block.
+// The block scanner is NOT thread-safe.
 type BlockScanner struct {
 	input          block.ReadSeekLocker
 	block          []byte
 	peeked, offset int64
 }
 
+// Next returns true if there is a next block and moves the cursor forward.
 func (scanner *BlockScanner) Next() bool {
 	scanner.Skip()
 	block, offset, ok := block.Seek(scanner.input, scanner.offset)
@@ -40,6 +42,7 @@ func (scanner *BlockScanner) Next() bool {
 	return true
 }
 
+// Peek returns true if there is a next block, but does not move the cursor forward.
 func (scanner *BlockScanner) Peek() bool {
 	block, offset, ok := block.Seek(scanner.input, scanner.offset)
 	if !ok {
@@ -50,20 +53,25 @@ func (scanner *BlockScanner) Peek() bool {
 	return true
 }
 
+// Skip skips the current block.
 func (scanner *BlockScanner) Skip() {
 	scanner.offset += scanner.peeked
 	scanner.peeked = 0
 }
 
+// Block returns the last-scanned block.
 func (scanner *BlockScanner) Block() []byte {
 	return scanner.block
 }
 
+// RowScanner scans through rows of a block.
+// The scanner is NOT thread-safe.
 type RowScanner struct {
 	block, key, value []byte
 	peeked, offset    int64
 }
 
+// Next moves the cursor forward and returns true if there is a next row.
 func (scanner *RowScanner) Next() bool {
 	scanner.Skip()
 	key, value, offset, ok := block.NextRow(scanner.block, scanner.offset)
@@ -76,6 +84,7 @@ func (scanner *RowScanner) Next() bool {
 	return true
 }
 
+// Peek returns true if there is a next row.
 func (scanner *RowScanner) Peek() bool {
 	key, value, offset, ok := block.NextRow(scanner.block, scanner.offset)
 	if !ok {
@@ -87,33 +96,33 @@ func (scanner *RowScanner) Peek() bool {
 	return true
 }
 
+// Skip skips the current row.
 func (scanner *RowScanner) Skip() {
 	scanner.offset += scanner.peeked
 	scanner.peeked = 0
 }
 
+// Key returns the last-scanned key.
 func (scanner *RowScanner) Key() []byte {
 	return scanner.key
 }
 
+// Value returns the last-scanned value.
 func (scanner *RowScanner) Value() []byte {
 	return scanner.value
 }
 
-type Scanner interface {
-	Next() bool
-	Key() []byte
-	Value() []byte
-}
-
-type TableScanner struct {
+// Scanner can scan through a table row-by-row while automatically fetching new blocks.
+type Scanner struct {
 	block BlockScanner
 	row   RowScanner
 
 	key, value []byte
 }
 
-func (scanner *TableScanner) Next() bool {
+// Next loads the next row (if possible) and returns true if a new key-value pair has been fetched.
+// It moves the cursor one step forward.
+func (scanner *Scanner) Next() bool {
 	next := scanner.row.Next()
 	for !next && scanner.block.Next() {
 		scanner.row = ScanRows(scanner.block.Block())
@@ -124,30 +133,37 @@ func (scanner *TableScanner) Next() bool {
 	return next
 }
 
-func (scanner *TableScanner) Peek() bool {
+// Peek loads the next row (if possible) and returns true if a new key-value pair has been fetched.
+// It does not actually move the current cursor forward.
+func (scanner *Scanner) Peek() bool {
 	next := scanner.row.Peek()
-	for !next && scanner.block.Next() {
-		scanner.row = ScanRows(scanner.block.Block())
-		next = scanner.row.Peek()
+	for !next && scanner.block.Peek() {
+		row := ScanRows(scanner.block.Block())
+		next = row.Peek()
 	}
 	scanner.key = scanner.row.Key()
 	scanner.value = scanner.row.Value()
 	return next
 }
 
-func (scanner *TableScanner) Skip() {
+// Skip skips the current cursor position.
+func (scanner *Scanner) Skip() {
 	scanner.row.Skip()
 }
 
-func (scanner *TableScanner) Key() []byte {
+// Key returns the key of the current cursor position.
+func (scanner *Scanner) Key() []byte {
 	return scanner.key
 }
 
-func (scanner *TableScanner) Value() []byte {
+// Value returns the value of the current cursor position.
+func (scanner *Scanner) Value() []byte {
 	return scanner.value
 }
 
-func (scanner *TableScanner) Compare(other *TableScanner) (int, []byte, []byte) {
+// Compare compares the current table scanner position with the other table scanner.
+// The smaller key-value pair ordered by (key, value) will be returned.
+func (scanner *Scanner) Compare(other *Scanner) (int, []byte, []byte) {
 	switch bytes.Compare(scanner.Key(), other.Key()) {
 	case 1:
 		return 1, other.Key(), other.Value()
