@@ -194,7 +194,7 @@ func (store *Store) Close() error {
 }
 
 // Put stores a key-value pair.
-func (store *Store) Put(key []byte, record *Record) error {
+func (store *Store) Put(key []byte, record *table.Record) error {
 	// Lock in-memory table write access.
 	store.memory.Lock()
 	defer store.memory.Unlock()
@@ -222,7 +222,7 @@ func (store *Store) Get(key []byte) []table.Record {
 	records := make([]table.Record, len(values))
 	// Only return record with highest version
 	for i, v := range values {
-		rec := &Record{}
+		rec := table.Record{}
 		rec.FromBytes(v)
 		records[i] = rec
 	}

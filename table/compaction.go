@@ -314,7 +314,7 @@ func (run *Run) Merge(table *Table) error {
 	}).Debug("Merging into run")
 	// End should point to [25 - 30]
 	merger := table.Scan()
-	iterators := make([]*TableScanner, end-begin)
+	iterators := make([]*Scanner, end-begin)
 	for i := begin; i < end; i++ {
 		iterators[i-begin] = run.Tables[i].Scan()
 	}
@@ -353,7 +353,7 @@ func (run *Run) Merge(table *Table) error {
 		return err
 	}
 	// Load all tables into run
-	tables, err := OpenTables(autoflush.Name)
+	tables, err := OpenTables(autoflush.Path)
 	if err != nil {
 		return fmt.Errorf("failed to load merged tables: %v", err)
 	}

@@ -5,9 +5,11 @@ import (
 	"math/rand"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 
 	store "github.com/lnsp/kvstore"
+	"github.com/lnsp/kvstore/table"
 	"github.com/sirupsen/logrus"
 )
 
@@ -47,7 +49,7 @@ func run() error {
 			select {
 			case task := <-tasks:
 				if task.action < 1 {
-					db.Put(task.key, &store.Record{Time: rand.Int63n(1024), Value: task.value})
+					db.Put(task.key, &table.Record{Time: rand.Int63n(1024), Value: task.value})
 				} else {
 					db.Get(task.key)
 				}
@@ -57,7 +59,7 @@ func run() error {
 		}
 	}
 	tasks := make(chan task)
-	for i := 0; i < 8; i++ {
+	for i := 0; i < runtime.NumCPU(); i++ {
 		go wq(tasks)
 	}
 	// fuzzy testing

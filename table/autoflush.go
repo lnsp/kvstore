@@ -38,7 +38,7 @@ func (table *AFTable) Append(key, value []byte) error {
 	defer table.mu.Unlock()
 	// Check if table needs to be initialized
 	if table.active == nil {
-		name := fmt.Sprintf("%s-%d", table.index)
+		name := fmt.Sprintf("%s-%d", table.Path, table.index)
 		new, err := NewWTable(name, table.RateLimit)
 		if err != nil {
 			return fmt.Errorf("setup new autoflush table: %v", err)
