@@ -14,7 +14,7 @@ type Metadata struct {
 
 // ReadFrom parses the given metadata into the source struct.
 func (md *Metadata) ReadFrom(rd io.Reader) error {
-	if err := binary.Read(rd, binary.LittleEndian, &md.Version); err != nil {
+	if err := binary.Read(rd, binary.BigEndian, &md.Version); err != nil {
 		return err
 	}
 	if err := binary.Read(rd, binary.LittleEndian, &md.Delete); err != nil {
@@ -26,7 +26,7 @@ func (md *Metadata) ReadFrom(rd io.Reader) error {
 // Bytes returns the binary representation of the record's metadata.
 func (md *Metadata) Bytes() []byte {
 	buffer := new(bytes.Buffer)
-	binary.Write(buffer, binary.LittleEndian, md.Version)
+	binary.Write(buffer, binary.BigEndian, md.Version)
 	binary.Write(buffer, binary.LittleEndian, md.Delete)
 	return buffer.Bytes()
 }
