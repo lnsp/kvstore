@@ -16,6 +16,8 @@ import (
 )
 
 // OpenMemtable opens a new memtable.
+// The prefix given is used for glob searching of memtable logs of the form "prefix(*).log".
+// All matched logs are then merged back together into a in-memory table.
 func OpenMemtable(prefix, path string) (*Memtable, error) {
 	matches, err := filepath.Glob(fmt.Sprintf("%s*%s", prefix, logSuffix))
 	if err != nil {
@@ -60,6 +62,12 @@ func RemovePartialTables(prefix string) error {
 	return nil
 }
 
+type WriteCloseSeeker interface {
+	io.Writer
+	io.Seeker
+	io.Closer
+}
+
 // Memtable is an in-memory key-value table.
 type Memtable struct {
 	Name string
@@ -68,41 +76,47 @@ type Memtable struct {
 	mem *index.Memory
 
 	// mu protects the fields below.
-	mu  sync.Mutex
-	log io.WriteCloser
+	mu       sync.Mutex
+	log      WriteCloseSeeker
+	logshift int64
 }
 
+// ReadFrom converts the byte stream item by item into a memtable.
+// The memory layout is the same used for log items.
+// Each entry consists of [keyLen : int64][valueLen : int64][key : bytes][value : bytes].
 func (table *Memtable) ReadFrom(cached io.Reader) (int64, error) {
 	// Read until nothing available
-	var keyLen, valueLen, bytesRead int64
-	for binary.Read(cached, binary.LittleEndian, &keyLen) == nil {
-		bytesRead += 8
-		// Read value len
-		if err := binary.Read(cached, binary.LittleEndian, &valueLen); err != nil && err != io.EOF {
-			return bytesRead, fmt.Errorf("failed to read value len: %v", err)
-		} else if err == io.EOF {
-			return bytesRead, nil
+	var keyLen, valueLen, totalBytesRead int64
+	for {
+		// Read key len
+		if err := binary.Read(cached, binary.LittleEndian, &keyLen); err == io.EOF || err == io.ErrUnexpectedEOF {
+			return totalBytesRead, nil
+		} else if err != nil {
+			return totalBytesRead, fmt.Errorf("failed to read key len: %v", err)
 		}
-		bytesRead += 8
+		// Read value len
+		if err := binary.Read(cached, binary.LittleEndian, &valueLen); err == io.EOF || err == io.ErrUnexpectedEOF {
+			return totalBytesRead, nil
+		} else if err != nil {
+			return totalBytesRead, fmt.Errorf("failed to read value len: %v", err)
+		}
 		// Read key
 		key := make([]byte, keyLen)
-		if _, err := cached.Read(key); err != nil && err != io.EOF {
-			return bytesRead, fmt.Errorf("failed to read key, expected len %d: %v", keyLen, err)
-		} else if err == io.EOF {
-			return bytesRead, nil
+		if n, err := cached.Read(key); int64(n) != keyLen || err == io.EOF || err == io.ErrUnexpectedEOF {
+			return totalBytesRead, nil
+		} else if err != nil {
+			return totalBytesRead, fmt.Errorf("failed to read key, expected len %d: %v", keyLen, err)
 		}
-		bytesRead += keyLen
 		// Read value
 		value := make([]byte, valueLen)
-		if _, err := cached.Read(value); err != nil && err != io.EOF {
-			return bytesRead, fmt.Errorf("failed to read value: %v", err)
-		} else if err == io.EOF {
-			return bytesRead, nil
+		if n, err := cached.Read(value); int64(n) != valueLen || err == io.EOF || err == io.ErrUnexpectedEOF {
+			return totalBytesRead, nil
+		} else if err != nil {
+			return totalBytesRead, fmt.Errorf("failed to read value: %v", err)
 		}
-		bytesRead += valueLen
 		table.mem.Put(key, value)
+		totalBytesRead += 16 + keyLen + valueLen
 	}
-	return bytesRead, nil
 }
 
 // NewMemtable initializes a new memtable.
@@ -134,6 +148,13 @@ func (table *Memtable) Get(key []byte) [][]byte {
 func (table *Memtable) commit(key, value []byte) error {
 	buffer := new(bytes.Buffer)
 	keyLen, valueLen := int64(len(key)), int64(len(value))
+	// In case the last write has failed, we may need to shift our current cursor back
+	if table.logshift != 0 {
+		if _, err := table.log.Seek(io.SeekCurrent, int(table.logshift)); err != nil {
+			return err
+		}
+		table.logshift = 0
+	}
 	if err := binary.Write(buffer, binary.LittleEndian, keyLen); err != nil {
 		return err
 	}
@@ -147,7 +168,8 @@ func (table *Memtable) commit(key, value []byte) error {
 		return err
 	}
 	// Commit
-	if _, err := table.log.Write(buffer.Bytes()); err != nil {
+	if n, err := table.log.Write(buffer.Bytes()); err != nil {
+		table.logshift = -int64(n)
 		return err
 	}
 	table.Size += 16 + keyLen + valueLen
@@ -198,7 +220,7 @@ func (table *Memtable) Close() error {
 func (table *Memtable) Compact() error {
 	table.mu.Lock()
 	defer table.mu.Unlock()
-	compacted, err := OpenAppentable(table.Name, DefaultBucket)
+	compacted, err := NewWTable(table.Name, DefaultBucket)
 	if err != nil {
 		return fmt.Errorf("failed to open writable table: %v", err)
 	}
