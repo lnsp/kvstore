@@ -71,6 +71,7 @@ func Open(name string) (*Table, error) {
 		Filter: index.NewFilter(),
 		Cache:  index.NewCache(MaxCacheSize),
 	}
+	// Fetch index from disk
 	indexFile, err := os.Open(name + indexSuffix)
 	if err != nil {
 		return table, err
@@ -79,6 +80,7 @@ func Open(name string) (*Table, error) {
 	if _, err := table.Index.ReadFrom(indexFile); err != nil {
 		return table, err
 	}
+	// Fetch filter from disk
 	filterFile, err := os.Open(name + filterSuffix)
 	if err != nil {
 		return table, err
@@ -87,6 +89,7 @@ func Open(name string) (*Table, error) {
 	if _, err := table.Filter.ReadFrom(filterFile); err != nil {
 		return table, err
 	}
+	// Calculate the key range covered by this table
 	if err := table.determineKeyRange(); err != nil {
 		return table, fmt.Errorf("failed to determine key range: %v", err)
 	}
@@ -187,13 +190,13 @@ func (table *Table) seek(key []byte) ([]byte, bool) {
 	return b.([]byte), ok
 }
 
-func (table *Table) openMerge() (*TableScanner, error) {
+func (table *Table) openMerge() (*Scanner, error) {
 	file, err := os.Open(table.Name + tableSuffix)
 	if err != nil {
 		return nil, err
 	}
 	table.mfile = &LockedFile{File: file}
-	return &TableScanner{
+	return &Scanner{
 		block: BlockScanner{
 			input: table.mfile,
 		},
@@ -214,8 +217,8 @@ func (table *Table) Get(key []byte) [][]byte {
 }
 
 // Scan returns a scanner that scans through the table.
-func (table *Table) Scan() *TableScanner {
-	return &TableScanner{
+func (table *Table) Scan() *Scanner {
+	return &Scanner{
 		block: BlockScanner{
 			input: table.File,
 		},
@@ -232,6 +235,11 @@ func minmax(a, b []byte) ([]byte, []byte) {
 }
 
 // Merge combines two tables into one.
+// The merge is performed according to two main rules.
+// If the keys on the left and right table are different, the smaller key is written first.
+// If the keys are equal, the larger of both values is written.
+// This leads to a very important side effect: Each Record has a Version value.
+// If two records with the same version are merged, the one with the newer version is written to disk.
 func Merge(path string, left *Table, right *Table, bucket *ratelimit.Bucket) error {
 	table, err := NewWTable(path, bucket)
 	if err != nil {
