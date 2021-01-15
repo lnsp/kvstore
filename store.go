@@ -110,6 +110,10 @@ func (store *Store) Restore() error {
 func (store *Store) mergeFlushed() {
 	store.memory.Lock()
 	store.flushed.Merge(store.active)
+	// Cleanup old store.active logs
+	store.active.Close()
+	store.active.Cleanup()
+	// Reset store.active to flushed table
 	store.active = store.flushed
 	store.flushed = nil
 	store.memory.Unlock()

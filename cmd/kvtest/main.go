@@ -6,7 +6,9 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"sync/atomic"
 	"syscall"
+	"time"
 
 	store "github.com/lnsp/kvstore"
 	"github.com/lnsp/kvstore/table"
@@ -21,7 +23,7 @@ func main() {
 }
 
 type task struct {
-	action     int
+	action     float32
 	key, value []byte
 }
 
@@ -44,15 +46,18 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	var _, opWrCounter int32
+	start := time.Now()
 	wq := func(tasks <-chan task) {
 		for {
 			select {
-			case task := <-tasks:
-				if task.action < 1 {
-					db.Put(task.key, &table.Record{Time: rand.Int63n(1024), Value: task.value})
-				} else {
-					db.Get(task.key)
-				}
+			default:
+				key := make([]byte, 2)
+				rand.Read(key)
+				value := make([]byte, 8)
+				rand.Read(value)
+				db.Put(key, &table.Record{Metadata: table.Metadata{Version: rand.Int63n(1024)}, Value: value})
+				atomic.AddInt32(&opWrCounter, 1)
 			case <-stop:
 				return
 			}
@@ -62,19 +67,16 @@ func run() error {
 	for i := 0; i < runtime.NumCPU(); i++ {
 		go wq(tasks)
 	}
+	defer func() {
+		fmt.Println("total writes:", opWrCounter)
+		fmt.Println("writes per second:", opWrCounter/int32(time.Since(start).Seconds()))
+	}()
 	// fuzzy testing
 	for {
 		select {
 		case <-cancel:
 			close(stop)
 			return db.Close()
-		default:
 		}
-		key := make([]byte, 2)
-		rand.Read(key)
-		value := make([]byte, 8)
-		rand.Read(value)
-		task := task{0, key, value}
-		tasks <- task
 	}
 }
