@@ -10,11 +10,50 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func TestMemtablePutAndGet(t *testing.T) {
+func MakeTmpMemtable() (*Memtable, func(), error) {
 	tmpdir, err := ioutil.TempDir("", "memtable")
+	if err != nil {
+		return nil, func() {}, err
+	}
+	memtable, err := NewMemtable(filepath.Join(tmpdir, "memtable_test"))
+	if err != nil {
+		return nil, func() {}, err
+	}
+	return memtable, func() {
+		memtable.Close()
+		os.RemoveAll(tmpdir)
+	}, nil
+}
+
+func TestMemtableMerge(t *testing.T) {
+	memtable1, close1, err := MakeTmpMemtable()
 	assert.Nil(t, err)
-	memtable, err := NewMemtable(filepath.Join(tmpdir, "test"))
+	defer close1()
+
+	memtable2, close2, err := MakeTmpMemtable()
 	assert.Nil(t, err)
+	defer close2()
+
+	assert.Nil(t, memtable1.Put([]byte("hello"), []byte("world")))
+	assert.Nil(t, memtable1.Put([]byte("another"), []byte("value")))
+	assert.Nil(t, memtable2.Put([]byte("hello"), []byte("brother")))
+	assert.Nil(t, memtable2.Put([]byte("zzz"), []byte("sleepy")))
+
+	assert.Nil(t, memtable1.Merge(memtable2))
+	assert.Equal(t, [][]byte{
+		[]byte("brother"),
+		[]byte("world")},
+		memtable1.Get([]byte("hello")))
+	assert.Equal(t, [][]byte{[]byte("value")}, memtable1.Get([]byte("another")))
+	assert.Equal(t, [][]byte{[]byte("sleepy")}, memtable1.Get([]byte("zzz")))
+	assert.Len(t, memtable1.Get([]byte("notfound")), 0)
+}
+
+func TestMemtablePutAndGet(t *testing.T) {
+	memtable, close, err := MakeTmpMemtable()
+	assert.Nil(t, err)
+	defer close()
+
 	assert.Nil(t, memtable.Put([]byte("nothing"), []byte("important")))
 	assert.Nil(t, memtable.Put([]byte("just"), []byte("memtable things")))
 	assert.Nil(t, memtable.Put([]byte("what"), []byte("omega")))
@@ -22,18 +61,16 @@ func TestMemtablePutAndGet(t *testing.T) {
 	assert.Equal(t, [][]byte{[]byte("important")}, memtable.Get([]byte("nothing")))
 	assert.Equal(t, [][]byte{[]byte("memtable things")}, memtable.Get([]byte("just")))
 	assert.Equal(t, [][]byte{[]byte("alpha"), []byte("omega")}, memtable.Get([]byte("what")))
-	// Cleanup
-	assert.Nil(t, os.RemoveAll(tmpdir))
 }
 
 func TestMemtableWrite(t *testing.T) {
-	tmpdir, err := ioutil.TempDir("", "memtable")
+	memtable, close, err := MakeTmpMemtable()
 	assert.Nil(t, err)
-	memtable, err := NewMemtable(filepath.Join(tmpdir, "test"))
-	assert.Nil(t, err)
+	defer close()
+
 	assert.Nil(t, memtable.Put([]byte("nothingi"), []byte("mportant")))
 	assert.Nil(t, memtable.Put([]byte("just"), []byte("memorythings")))
-	memtable.Close()
+
 	// Check file
 	bb, err := ioutil.ReadFile(memtable.Name + logSuffix)
 	assert.Nil(t, err)
@@ -47,16 +84,14 @@ func TestMemtableWrite(t *testing.T) {
 		'j', 'u', 's', 't',
 		'm', 'e', 'm', 'o', 'r', 'y', 't', 'h', 'i', 'n', 'g', 's',
 	}, bb)
-	// Cleanup
-	assert.Nil(t, os.RemoveAll(tmpdir))
 }
 
 func TestMemtableReadFrom(t *testing.T) {
+	memtable, close, err := MakeTmpMemtable()
+	assert.Nil(t, err)
+	defer close()
+
 	// Create tmp directory
-	tmpdir, err := ioutil.TempDir("", "memtable")
-	assert.Nil(t, err)
-	memtable, err := NewMemtable(filepath.Join(tmpdir, "test"))
-	assert.Nil(t, err)
 	t.Run("decode memtable", func(t *testing.T) {
 		bb := bytes.NewBuffer([]byte{
 			8, 0, 0, 0, 0, 0, 0, 0,
@@ -154,6 +189,4 @@ func TestMemtableReadFrom(t *testing.T) {
 			})
 		}
 	})
-	// Cleanup
-	assert.Nil(t, os.RemoveAll(tmpdir))
 }

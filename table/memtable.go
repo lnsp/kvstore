@@ -40,6 +40,12 @@ func OpenMemtable(prefix, path string) (*Memtable, error) {
 		if err := memtable.Merge(old); err != nil {
 			return nil, err
 		}
+		if err := old.Close(); err != nil {
+			return nil, err
+		}
+		if err := old.Cleanup(); err != nil {
+			return nil, err
+		}
 	}
 	return memtable, nil
 }
@@ -92,27 +98,27 @@ func (table *Memtable) ReadFrom(cached io.Reader) (int64, error) {
 		if err := binary.Read(cached, binary.LittleEndian, &keyLen); err == io.EOF || err == io.ErrUnexpectedEOF {
 			return totalBytesRead, nil
 		} else if err != nil {
-			return totalBytesRead, fmt.Errorf("failed to read key len: %v", err)
+			return totalBytesRead, fmt.Errorf("read key len: %v", err)
 		}
 		// Read value len
 		if err := binary.Read(cached, binary.LittleEndian, &valueLen); err == io.EOF || err == io.ErrUnexpectedEOF {
 			return totalBytesRead, nil
 		} else if err != nil {
-			return totalBytesRead, fmt.Errorf("failed to read value len: %v", err)
+			return totalBytesRead, fmt.Errorf("read value len: %v", err)
 		}
 		// Read key
 		key := make([]byte, keyLen)
-		if n, err := cached.Read(key); int64(n) != keyLen || err == io.EOF || err == io.ErrUnexpectedEOF {
+		if n, err := io.ReadFull(cached, key); int64(n) != keyLen || err == io.EOF || err == io.ErrUnexpectedEOF {
 			return totalBytesRead, nil
 		} else if err != nil {
-			return totalBytesRead, fmt.Errorf("failed to read key, expected len %d: %v", keyLen, err)
+			return totalBytesRead, fmt.Errorf("read key of len %d: %v", keyLen, err)
 		}
 		// Read value
 		value := make([]byte, valueLen)
-		if n, err := cached.Read(value); int64(n) != valueLen || err == io.EOF || err == io.ErrUnexpectedEOF {
+		if n, err := io.ReadFull(cached, value); int64(n) != valueLen || err == io.EOF || err == io.ErrUnexpectedEOF {
 			return totalBytesRead, nil
 		} else if err != nil {
-			return totalBytesRead, fmt.Errorf("failed to read value: %v", err)
+			return totalBytesRead, fmt.Errorf("read value of len %d: %v", valueLen, err)
 		}
 		table.mem.Put(key, value)
 		totalBytesRead += 16 + keyLen + valueLen
@@ -201,13 +207,6 @@ func (table *Memtable) Merge(newer *Memtable) error {
 		}
 		table.mem.Put(key, value)
 	}
-	if err := newer.Close(); err != nil {
-		return err
-	}
-	// Remove old log file
-	if err := newer.Cleanup(); err != nil {
-		return err
-	}
 	return nil
 }
 
@@ -236,10 +235,12 @@ func (table *Memtable) Compact() error {
 	return nil
 }
 
+// Cleanup removes the logfile of the memtable.
 func (table *Memtable) Cleanup() error {
 	return os.Remove(table.Name + logSuffix)
 }
 
+// All returns all stored memtable records.
 func (table *Memtable) All() []MemtableRecord {
 	records := make([]MemtableRecord, table.mem.Size())
 	iterator := table.mem.SetIterator()
@@ -249,6 +250,7 @@ func (table *Memtable) All() []MemtableRecord {
 	return records
 }
 
+// MemtableRecord is a mapping from a key to one or more values.
 type MemtableRecord struct {
 	Key    []byte
 	Values [][]byte
