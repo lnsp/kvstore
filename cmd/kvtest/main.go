@@ -37,7 +37,7 @@ func run() error {
 	// Notify on kill
 	cancel := make(chan os.Signal, 1)
 	stop := make(chan bool)
-	signal.Notify(cancel, syscall.SIGINT, syscall.SIGKILL, syscall.SIGTERM)
+	signal.Notify(cancel, syscall.SIGINT, syscall.SIGTERM)
 	// Open local database
 	db, err := store.New("local")
 	if err != nil {
