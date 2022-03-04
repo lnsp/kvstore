@@ -12,4 +12,4 @@ This repository contains the source of kvstore, a flexible associative data stor
 - [x] Table-level access conflict resolution
 - [x] Row-level access conflict resolution
 - [x] Automatic memtable flushing on overflow
-- [x] Automatic table merging on overflow using leveled compaction
+- [ ] Automatic table merging on overflow using leveled compaction
