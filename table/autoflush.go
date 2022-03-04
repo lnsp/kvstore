@@ -13,7 +13,7 @@ type WritableAutoflushTable struct {
 	Written  []string
 
 	ratelimit *ratelimit.Bucket
-	active    *WritableTable
+	active    *WTable
 }
 
 func OpenWritableWithAutoflush(name string, size int64, bucket *ratelimit.Bucket) *WritableAutoflushTable {
@@ -31,18 +31,18 @@ func (table *WritableAutoflushTable) Append(key, value []byte) error {
 	if table.active == nil {
 		name := table.Basename + "-" + strconv.Itoa(len(table.Written))
 		table.Written = append(table.Written, name)
-		new, err := OpenWritableWithRateLimit(name, table.ratelimit)
+		new, err := OpenWTableFromFile(name, table.ratelimit)
 		if err != nil {
-			return fmt.Errorf("failed to setup new autoflush table: %v", err)
+			return fmt.Errorf("setup new autoflush table: %w", err)
 		}
 		table.active = new
 	}
 	// Append record
 	if err := table.active.Append(key, value); err != nil {
-		return fmt.Errorf("failed to append to autoflush table: %v", err)
+		return fmt.Errorf("append to autoflush table: %w", err)
 	}
 	// Check if table is too big, flush and replace if required
-	if table.active.Size >= table.MaxSize {
+	if table.active.Size() >= table.MaxSize {
 		if err := table.active.Close(); err != nil {
 			return err
 		}

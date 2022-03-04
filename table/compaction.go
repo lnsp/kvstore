@@ -21,8 +21,8 @@ const (
 	DefaultLeveledFactor = 10
 )
 
-func NewLeveledCompaction(name string) *Leveled {
-	return &Leveled{
+func NewLeveledCompaction(name string) *LeveledCompaction {
+	return &LeveledCompaction{
 		Name:             name,
 		BaseSize:         DefaultLeveledSize,
 		BaseCount:        DefaultLeveledBase,
@@ -33,7 +33,7 @@ func NewLeveledCompaction(name string) *Leveled {
 	}
 }
 
-type Leveled struct {
+type LeveledCompaction struct {
 	Name                                    string
 	BaseSize, LevelSize, LevelSizeFactor    int64
 	BaseCount, LevelCount, LevelCountFactor int
@@ -44,7 +44,7 @@ type Leveled struct {
 	mu sync.RWMutex
 }
 
-func (compaction *Leveled) Restore(tables []*Table) error {
+func (compaction *LeveledCompaction) Restore(tables []*Table) error {
 	// Check if tables is prefixed
 	for _, table := range tables {
 		if strings.HasPrefix(table.Name, RunPrefix) {
@@ -81,7 +81,7 @@ func (compaction *Leveled) Restore(tables []*Table) error {
 	return nil
 }
 
-func (compaction *Leveled) Close() error {
+func (compaction *LeveledCompaction) Close() error {
 	compaction.mu.Lock()
 	defer compaction.mu.Unlock()
 	for _, t := range compaction.Base {
@@ -97,7 +97,7 @@ func (compaction *Leveled) Close() error {
 	return nil
 }
 
-func (compaction *Leveled) Get(key []byte) [][]byte {
+func (compaction *LeveledCompaction) Get(key []byte) [][]byte {
 	compaction.mu.RLock()
 	values := make([][]byte, 0, 1)
 	for _, t := range compaction.Base {
@@ -110,17 +110,17 @@ func (compaction *Leveled) Get(key []byte) [][]byte {
 	return values
 }
 
-func (compaction *Leveled) Add(table *Table) error {
+func (compaction *LeveledCompaction) Add(table *Table) error {
 	compaction.mu.Lock()
 	defer compaction.mu.Unlock()
 	compaction.Base = append(compaction.Base, table)
 	if err := compaction.rebalance(); err != nil {
-		return fmt.Errorf("leveled compaction rebalance: %v", err)
+		return fmt.Errorf("leveled compaction rebalance: %w", err)
 	}
 	return nil
 }
 
-func (compaction *Leveled) nextLevel(table *Table) error {
+func (compaction *LeveledCompaction) nextLevel(table *Table) error {
 	level := len(compaction.Levels)
 	next := &Run{
 		Name:     fmt.Sprintf("%s-level%04d", compaction.Name, level),
@@ -130,7 +130,7 @@ func (compaction *Leveled) nextLevel(table *Table) error {
 	if err := next.Merge(table); err != nil {
 		return fmt.Errorf("merge into next level: %w", err)
 	}
-	compaction.Levels = append(compaction.Levels)
+	compaction.Levels = append(compaction.Levels, next)
 	compaction.LevelCount *= compaction.LevelCountFactor
 	compaction.LevelSize *= compaction.LevelSizeFactor
 	return nil
@@ -139,7 +139,7 @@ func (compaction *Leveled) nextLevel(table *Table) error {
 // rebalance assumes that compaction has already been locked.
 // We first pick the merge victim from our Base slice.
 // Then try to merge it up the tree (as long as there are existing levels).
-func (compaction *Leveled) rebalance() error {
+func (compaction *LeveledCompaction) rebalance() error {
 	// Ignore if no rebalance needed
 	if len(compaction.Base) < 1 || len(compaction.Base) < compaction.BaseCount {
 		return nil

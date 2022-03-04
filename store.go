@@ -81,8 +81,8 @@ type Store struct {
 	// flush synchronizes all write-actions related to the flushed memtable.
 	flush mutex
 
-	active, flushed *table.Memtable
-	compaction      *table.Leveled
+	active, flushed *table.MTable
+	compaction      *table.LeveledCompaction
 }
 
 func New(name string) (*Store, error) {
@@ -99,16 +99,16 @@ func New(name string) (*Store, error) {
 
 func (store *Store) Restore() error {
 	// Remove intermediate tables
-	err := table.RemoveIntermediateTables(store.Name)
+	err := table.RemoveTableLogs(store.Name)
 	if err != nil {
 		return err
 	}
 	// Load new memtable
-	store.active, err = table.OpenMemtable(store.Name, tableName(store.Name))
+	store.active, err = table.Recover(store.Name, tableName(store.Name))
 	if err != nil {
 		return err
 	}
-	if store.active.Size >= MaxMemSize {
+	if store.active.Size() >= MaxMemSize {
 		if err := store.Flush(); err != nil {
 			return err
 		}
@@ -118,7 +118,7 @@ func (store *Store) Restore() error {
 		return err
 	}
 	if err := store.compaction.Restore(tables); err != nil {
-		return fmt.Errorf("failed to restore tables: %w", err)
+		return fmt.Errorf("restore tables: %w", err)
 	}
 	return nil
 }
@@ -142,7 +142,7 @@ func (store *Store) Flush() error {
 	store.flush.TryLock()
 	// Lock any "flush" related activities
 	defer store.flush.Unlock()
-	replace, err := table.NewMemtable(tableName(store.Name))
+	replace, err := table.NewMTableFromFile(tableName(store.Name))
 	if err != nil {
 		return err
 	}
@@ -218,7 +218,7 @@ func (store *Store) Put(key []byte, record *Record) error {
 	if err := store.active.Put(key, record.Bytes()); err != nil {
 		return err
 	}
-	if store.active.Size >= MaxMemSize && store.flush.TryLock() {
+	if store.active.Size() >= MaxMemSize && store.flush.TryLock() {
 		go store.Flush()
 	}
 	return nil
@@ -248,9 +248,9 @@ func (store *Store) Get(key []byte) []*Record {
 func (store *Store) MemSize() int64 {
 	var size int64
 	store.memory.Lock()
-	size += store.active.Size
+	size += store.active.Size()
 	if store.flushed != nil {
-		size += store.flushed.Size
+		size += store.flushed.Size()
 	}
 	store.memory.Unlock()
 	return size

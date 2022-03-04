@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -17,10 +18,6 @@ import (
 )
 
 var logger = logrus.New()
-
-func init() {
-	logger.SetLevel(logrus.DebugLevel)
-}
 
 var DefaultBucket = ratelimit.NewBucketWithRate(2<<21, 2<<22)
 
@@ -91,12 +88,13 @@ func Open(name string) (*Table, error) {
 	return table, nil
 }
 
-func OpenMemtable(prefix, name string) (*Memtable, error) {
+// Recover recovers a set of memtables matched by the given prefix and stores a merged version inside a single memtable.
+func Recover(prefix, name string) (*MTable, error) {
 	matches, err := filepath.Glob(fmt.Sprintf("%s*%s", prefix, logSuffix))
 	if err != nil {
 		return nil, err
 	}
-	memtable, err := NewMemtable(name)
+	memtable, err := NewMTableFromFile(name)
 	if err != nil {
 		return nil, err
 	}
@@ -106,7 +104,7 @@ func OpenMemtable(prefix, name string) (*Memtable, error) {
 			"from": table,
 			"into": name,
 		}).Debug("merge memtables")
-		old, err := NewMemtable(strings.TrimSuffix(table, logSuffix))
+		old, err := NewMTableFromFile(strings.TrimSuffix(table, logSuffix))
 		if err != nil {
 			return nil, err
 		}
@@ -117,7 +115,8 @@ func OpenMemtable(prefix, name string) (*Memtable, error) {
 	return memtable, nil
 }
 
-func RemoveIntermediateTables(prefix string) error {
+// RemoveTableLogs drops all tables logs associated with tables with the given prefix.
+func RemoveTableLogs(prefix string) error {
 	matches, err := filepath.Glob(fmt.Sprintf("%s*%s", prefix, tableSuffix))
 	if err != nil {
 		return err
@@ -269,7 +268,7 @@ func minmax(a, b []byte) ([]byte, []byte) {
 
 // Merge combines two tables into one.
 func Merge(name string, left *Table, right *Table) error {
-	table, err := OpenWritable(name)
+	table, err := OpenWTableFromFile(name, nil)
 	if err != nil {
 		return err
 	}
@@ -278,10 +277,12 @@ func Merge(name string, left *Table, right *Table) error {
 	if err != nil {
 		return err
 	}
+	defer left.closeMerge()
 	rs, err := right.openMerge()
 	if err != nil {
 		return err
 	}
+	defer right.closeMerge()
 	for ls.Peek() && rs.Peek() {
 		switch bytes.Compare(ls.Key(), rs.Key()) {
 		case 0:
@@ -322,7 +323,7 @@ func seekCompressedBlock(file *File, offset int64) ([]byte, int64, bool) {
 	file.Lock()
 	defer file.Unlock()
 	// Seek to offset
-	if _, err := file.Seek(offset, os.SEEK_SET); err != nil {
+	if _, err := file.Seek(offset, io.SeekStart); err != nil {
 		return nil, 0, false
 	}
 	var compressedBlockSize int64
